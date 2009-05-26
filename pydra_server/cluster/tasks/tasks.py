@@ -76,6 +76,8 @@ class Task(object):
     msg = None
     description = 'Default description about Task baseclass.'
 
+    priority = 5 # 0 (highest) to 10 (lowest)
+
     def __init__(self, msg=None):
         self.msg = msg
 
@@ -435,8 +437,9 @@ class ParallelTask(Task):
     subtask = None              # subtask that is parallelized
     subtask_key = None          # cached key from subtask
 
-    def __init__(self, msg=None):
+    def __init__(self, subtask, msg=None):
         Task.__init__(self, msg)
+        self.subtask = subtask
         self._lock = Lock()
 
     def __setattr__(self, key, value):
@@ -531,6 +534,7 @@ class ParallelTask(Task):
 
                     #all work is done, call the task specific function to combine the results 
                     else:
+                        # code below is unlikely to work
                         results = self.work_complete()
                         self.task_complete(results)
 

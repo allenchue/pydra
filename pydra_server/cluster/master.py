@@ -62,6 +62,7 @@ from pydra_server.cluster.tasks.task_manager import TaskManager
 from pydra_server.cluster.auth.rsa_auth import RSAClient, load_crypto
 from pydra_server.cluster.auth.worker_avatar import WorkerAvatar
 from pydra_server.cluster.amf.interface import AMFInterface
+from pydar_server.cluster.sched import Scheduler
 
 
 class NodeClientFactory(pb.PBClientFactory):
@@ -132,6 +133,7 @@ class Master(object):
 
         self.host = 'localhost'
         self.port = 18800
+        self.scheduler = Scheduler()
 
     def get_services(self):
         """
