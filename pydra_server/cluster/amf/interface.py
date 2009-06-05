@@ -21,10 +21,16 @@ import datetime, time
 import hashlib
 
 from twisted.spread import pb
-from twisted.internet import reactor
+from twisted.internet import reactor, defer
 from twisted.python.randbytes import secureRandom
 from authenticator import AMFAuthenticator
 
+from django.core.paginator import Paginator, InvalidPage, EmptyPage
+
+from pydra_server.models import TaskInstance
+
+import logging
+logger = logging.getLogger('root')
 
 def authenticated(fn):
     """
@@ -144,7 +150,7 @@ class AMFInterface(pb.Root):
         """
         Remote function just for determining that Master is responsive
         """
-        print '[debug] is alive'
+        logger.debug('is alive')
         return 1
 
 
@@ -207,37 +213,72 @@ class AMFInterface(pb.Root):
 
 
     @authenticated
-    def run_task(self, _, key):
+    def run_task(self, _, task_key, args=None):
         """
         Runs a task.  It it first placed in the queue and the queue manager
-        will run it when appropriate
+        will run it when appropriate.
+
+        Args should be a dictionary of values.  It is acceptable for this to be
+        improperly typed data.  ie. Integer given as a String.  This function
+        will parse and clean the args using the form class for the Task
         """
-        task_instance =  self.master.queue_task(key)
+
+        # args coming from the controller need to be parsed by the form. This
+        # will give proper typing to the data and allow validation.
+        if args:
+            task = self.master.available_tasks[task_key]
+            form_instance = task.form(args)
+            if form_instance.is_valid():
+                # repackage properly cleaned data
+                args = {}
+                for key, val in form_instance.cleaned_data.items():
+                    args[key] = val
+
+            else:
+                # not valid, report errors.
+                return {
+                    'task_key':task_key,
+                    'errors':form_instance.errors
+                }
+
+        task_instance =  self.master.queue_task(task_key, args=args)
 
         return {
-                'task_key':key,
+                'task_key':task_key,
                 'instance_id':task_instance.id,
                 'time':time.mktime(task_instance.queued.timetuple())
                }
 
+
     @authenticated
-    def task_status(self, _):
+    def task_history(self, _, key, page):
+
+        instances = TaskInstance.objects.filter(task_key=key).order_by('-completed').order_by('-started')
+        paginator = Paginator(instances, 10)
+
+         # If page request (9999) is out of range, deliver last page of results.
+        try:
+            paginated = paginator.page(page)
+
+        except (EmptyPage, InvalidPage):
+            page = paginator.num_pages
+            paginated = paginator.page(page)
+
+        return {
+                'prev':paginated.has_previous(),
+                'next':paginated.has_next(),
+                'page':page,
+                'instances':[instance for instance in paginated.object_list]
+               }
+
+
+    @authenticated
+    def task_statuses(self, _):
         """
         Returns the status of all running tasks.  This is a detailed list
         of progress and status messages.
         """
-        import time
-        from pydra_server.cluster.tasks.tasks import STATUS_STOPPED, STATUS_RUNNING
-        statuses = {}
-
-        for instance in self.master._queue:
-            statuses[instance.id] = {'s':STATUS_STOPPED}
-
-        for instance in self.master._running:
-            start = time.mktime(instance.started.timetuple())
-            statuses[instance.id] = {'s':STATUS_RUNNING, 't':start}
-
-        return statuses
+        return self.master.task_statuses()
 
 
     @authenticated

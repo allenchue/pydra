@@ -20,6 +20,9 @@
 from rsa_auth import RSAAvatar
 from Crypto.PublicKey import RSA
 
+import logging
+logger = logging.getLogger('root')
+
 class WorkerAvatar(RSAAvatar):
     """
     Avatar used by Workers connecting to the Master.
@@ -38,10 +41,18 @@ class WorkerAvatar(RSAAvatar):
         self.remote = mind
 
     def detached(self, mind):
-        print '[info] worker:%s - disconnected' % self.name
+        logger.info('worker:%s - disconnected' % self.name)
         if self.authenticated:
             self.server.remove_worker(self.name)
         self.remote = None
+
+
+    def perspective_failed(self, message, workunit_key):
+        """
+        Called by workers when they task they were running threw an exception
+        """
+        return self.server.task_failed(self.name, message, workunit_key)
+
 
     def perspective_send_results(self, results, workunit_key):
         """
@@ -64,3 +75,10 @@ class WorkerAvatar(RSAAvatar):
         for a worker in the cluster to process the args sent
         """
         return self.server.request_worker(self, subtask_key, args, workunit_key)
+
+
+    def perspective_task_status(self):
+        """
+        returns the status (progress) of the task this worker is working on
+        """
+        return self.server.task_status(self)

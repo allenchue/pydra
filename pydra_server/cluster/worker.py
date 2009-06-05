@@ -22,7 +22,7 @@
 from __future__ import with_statement
 
 #
-# Setup django environment 
+# Setup django environment
 #
 if __name__ == '__main__':
     import sys
@@ -47,6 +47,12 @@ from pydra_server.cluster.tasks.task_manager import TaskManager
 from constants import *
 
 
+# init logging
+import settings
+from pydra_server.logging.logger import init_logging
+logger = init_logging(settings.LOG_FILENAME_NODE)
+
+
 class MasterClientFactory(pb.PBClientFactory):
     """
     Subclassing of PBClientFactory to add automatic reconnection
@@ -58,12 +64,12 @@ class MasterClientFactory(pb.PBClientFactory):
         self.kwargs = kwargs
 
     def clientConnectionLost(self, connector, reason):
-        print '[warning] Lost connection to master.  Reason:', reason
+        logger.warning('Lost connection to master.  Reason:', reason)
         pb.PBClientFactory.clientConnectionLost(self, connector, reason)
         self.reconnect_func(*(self.args), **(self.kwargs))
 
     def clientConnectionFailed(self, connector, reason):
-        print '[warning] Connection to master failed. Reason:', reason
+        logger.warning('Connection to master failed. Reason:', reason)
         pb.PBClientFactory.clientConnectionFailed(self, connector, reason)
 
 
@@ -78,6 +84,7 @@ class Worker(pb.Referenceable):
     def __init__(self, master_host, master_port, node_key, worker_key):
         self.id = id
         self.__task = None
+        self.__task_instance = None
         self.__results = None
         self.__stop_flag = None
         self.__lock = Lock()
@@ -100,7 +107,7 @@ class Worker(pb.Referenceable):
         self.task_manager.autodiscover()
         self.available_tasks = self.task_manager.registry
 
-        print '[info] Started Worker: %s' % worker_key
+        logger.info('Started Worker: %s' % worker_key)
         self.connect()
 
     def connect(self):
@@ -109,7 +116,7 @@ class Worker(pb.Referenceable):
         """
         import fileinput
 
-        print '[info] worker:%s - connecting to master @ %s:%s' % (self.worker_key, self.master_host, self.master_port)
+        logger.info('worker:%s - connecting to master @ %s:%s' % (self.worker_key, self.master_host, self.master_port))
         factory = MasterClientFactory(self.reconnect)
         reactor.connectTCP(self.master_host, self.master_port, factory)
 
@@ -123,7 +130,7 @@ class Worker(pb.Referenceable):
         #let increment grow exponentially to 5 minutes
         if self.reconnect_count < 6:
             self.reconnect_count += 1 
-        print '[debug] worker:%s - reconnecting in %i seconds' % (self.worker_key, reconnect_delay)
+        logger.debug('worker:%s - reconnecting in %i seconds' % (self.worker_key, reconnect_delay))
         self.reconnect_call_ID = reactor.callLater(reconnect_delay, self.connect)
 
     def connected(self, result):
@@ -134,7 +141,7 @@ class Worker(pb.Referenceable):
             self.master = result
         self.reconnect_count = 0
 
-        print '[info] worker:%s - connected to master @ %s:%s' % (self.worker_key, self.master_host, self.master_port)
+        logger.info('worker:%s - connected to master @ %s:%s' % (self.worker_key, self.master_host, self.master_port))
 
         # Authenticate with the master
         self.rsa_client.auth(result, self.master_pub_key.encrypt)
@@ -162,21 +169,28 @@ class Worker(pb.Referenceable):
 
         self.available_workers = available_workers
 
-        print '[info] Worker:%s - starting task: %s:%s' % (self.worker_key, key,subtask_key)
+        logger.info('Worker:%s - starting task: %s:%s  %s' % (self.worker_key, key,subtask_key, args))
         #create an instance of the requested task
         self.__task_instance = object.__new__(self.available_tasks[key])
         self.__task_instance.__init__()
         self.__task_instance.parent = self
 
-        return self.__task_instance.start(args, subtask_key, self.work_complete)
+        # process args to make sure they are no longer unicode
+        clean_args = {}
+        if args:
+            for key, arg in args.items():
+                clean_args[key.__str__()] = arg
+
+        return self.__task_instance.start(clean_args, subtask_key, self.work_complete, errback=self.work_failed)
 
 
     def stop_task(self):
         """
         Stops the current task
         """
-        print '[info] %s - Received STOP command' % self.worker_key
-        self.__task_instance._stop()
+        logger.info('%s - Received STOP command' % self.worker_key)
+        if self.__task_instance:
+            self.__task_instance._stop()
 
 
     def status(self):
@@ -223,6 +237,23 @@ class Worker(pb.Referenceable):
                     self.__results = results
 
 
+    def work_failed(self, results):
+        """
+        Callback that there was an exception thrown by the task
+        """
+        self.__task = None
+
+        with self.__lock_connection:
+            if self.master:
+                deferred = self.master.callRemote("failed", results, self.__workunit_key)
+                #deferred.addErrback(self.send_failed_failed, results, self.__workunit_key)
+
+            # master disapeared, hold failure until it comes back online and requests it
+            else:
+                #TODO implement me
+                pass
+
+
     def send_results_failed(self, results, task_results, workunit_key):
         """
         Errback called when sending results to the master fails.  resend when
@@ -235,7 +266,7 @@ class Worker(pb.Referenceable):
             if self.master:
                 # reconnected, just resend the call.  The call is recursive from this point
                 # if by some odd chance it disconnects again while sending
-                print '[error] results failed to send by master is still here'
+                logger.error('results failed to send by master is still here')
                 #deferred = self.master.callRemote("send_results", task_results, task_results)
                 #deferred.addErrback(self.send_results_failed, task_results, task_results)
 
@@ -257,7 +288,7 @@ class Worker(pb.Referenceable):
             if master:
                 # reconnected, just resend the call.  The call is recursive from this point
                 # if by some odd chance it disconnects again while sending
-                print 'STOP FAILED BUT MASTER STILL HERE'
+                logger.error('STOP FAILED BUT MASTER STILL HERE')
                 #deferred = self.master.callRemote("stopped")
                 #deferred.addErrBack(self.send_stopped_failed)
 
@@ -265,6 +296,14 @@ class Worker(pb.Referenceable):
                 #nope really isn't connected.  set flag.  even if connection is in progress
                 #this thread has the lock and reconnection cant finish till we release it
                 self.__stop_flag = True
+
+
+    def task_status(self):
+        """
+        Returns status of task this task is performing
+        """
+        if self.__task_instance:
+            return self.__task_instance.progress()
 
 
     def receive_results(self, results, subtask_key, workunit_key):
@@ -279,13 +318,13 @@ class Worker(pb.Referenceable):
         """
         Requests a work unit be handled by another worker in the cluster
         """
-        print '[info] Worker:%s - requesting worker for: %s' % (self.worker_key, subtask_key)
+        logger.info('Worker:%s - requesting worker for: %s' % (self.worker_key, subtask_key))
         deferred = self.master.callRemote('request_worker', subtask_key, args, workunit_key)
 
 
     def return_work(self, subtask_key, workunit_key):
         subtask = self.__task_instance.get_subtask(subtask_key.split('.'))
-        subtask.parent._work_unit_failed(workunit_key)
+        subtask.parent._worker_failed(workunit_key)
 
 
     def get_worker(self):
@@ -315,6 +354,10 @@ class Worker(pb.Referenceable):
         The work unit is returned so another worker can finish it.
         """
         return self.return_work(subtask_key, workunit_key)
+
+    def remote_task_status(self):
+        return self.task_status()
+
 
 if __name__ == "__main__":
     master_host = sys.argv[1]

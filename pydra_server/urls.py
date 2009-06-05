@@ -17,6 +17,7 @@
     along with Pydra.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+
 from django.conf.urls.defaults import *
 
 from views import *
@@ -36,6 +37,9 @@ urlpatterns = patterns('',
     (r'^jobs/run/$', run_task),
     (r'^jobs/cancel/$', cancel_task),
     (r'^jobs/progress/$', task_progress),
+
+    # job history urls
+    (r'^jobs/history/$', task_history), 
 
     #authentication
     (r'^accounts/login/$', login),

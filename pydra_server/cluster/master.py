@@ -55,14 +55,21 @@ from twisted.internet.error import AlreadyCalled
 from twisted.web import server, resource
 from twisted.cred import credentials
 from django.utils import simplejson
+import settings
 
 from pydra_server.models import Node, TaskInstance
 from pydra_server.cluster.constants import *
 from pydra_server.cluster.tasks.task_manager import TaskManager
+from pydra_server.cluster.tasks.tasks import STATUS_STOPPED, STATUS_RUNNING, STATUS_COMPLETE, STATUS_CANCELLED, STATUS_FAILED
 from pydra_server.cluster.auth.rsa_auth import RSAClient, load_crypto
 from pydra_server.cluster.auth.worker_avatar import WorkerAvatar
 from pydra_server.cluster.amf.interface import AMFInterface
 from pydar_server.cluster.sched import Scheduler
+
+
+# init logging
+from pydra_server.logging.logger import init_logging
+logger = init_logging(settings.LOG_FILENAME_MASTER)
 
 
 class NodeClientFactory(pb.PBClientFactory):
@@ -95,7 +102,7 @@ class Master(object):
     """
 
     def __init__(self):
-        print '[info] starting master'
+        logger.info('====== starting master ======')
 
         #locks
         self._lock = Lock()         #general lock, use when multiple shared resources are touched
@@ -109,6 +116,10 @@ class Master(object):
         self._running = list(TaskInstance.objects.running())
         self._running_workers = {}
         self._queue = list(TaskInstance.objects.queued())
+
+        #task statuses
+        self._task_statuses = {}
+        self._next_task_status_update = datetime.datetime.now()
 
         #cluster management
         self.workers = {}
@@ -171,7 +182,7 @@ class Master(object):
         try:
             context = DefaultOpenSSLContextFactory('ca-key.pem', 'ca-cert.pem')
         except:
-            print '[ERROR] - Problem loading certificate required for ControllerInterface from ca-key.pem and ca-cert.pem.  Generate certificate with gen-cert.sh'
+            logger.critical('Problem loading certificate required for ControllerInterface from ca-key.pem and ca-cert.pem.  Generate certificate with gen-cert.sh')
             sys.exit()
 
         controller_service = internet.SSLServer(18801, server.Site(root), contextFactory=context)
@@ -184,12 +195,12 @@ class Master(object):
         """
         Load node configuration from the database
         """
-        print '[info] loading nodes'
+        logger.info('loading nodes')
         nodes = Node.objects.all()
         node_dict = {}
         for node in nodes:
             node_dict[node.id] = node
-        print '[info] %i nodes loaded' % len(nodes)
+        logger.info('%i nodes loaded' % len(nodes))
         return node_dict
 
 
@@ -254,7 +265,7 @@ class Master(object):
                 node.ref = result[1]
 
 
-                print '[info] node:%s:%s - connected' % (node.host, node.port)
+                logger.info('node:%s:%s - connected' % (node.host, node.port))
 
                 # Authenticate with the node
                 pub_key = node.load_pub_key()
@@ -263,7 +274,7 @@ class Master(object):
 
             #failures
             else:
-                print '[error] node:%s:%s - failed to connect' % (node.host, node.port)
+                logger.error('node:%s:%s - failed to connect' % (node.host, node.port))
                 node.ref = None
                 failures = True
 
@@ -313,7 +324,7 @@ class Master(object):
                 #let increment grow exponentially to 5 minutes
                 if self.reconnect_count < 6:
                     self.reconnect_count += 1 
-                print '[debug] reconnecting in %i seconds' % reconnect_delay
+                logger.debug('reconnecting in %i seconds' % reconnect_delay)
                 self.reconnect_call_ID = reactor.callLater(reconnect_delay, self.connect)
 
 
@@ -345,7 +356,7 @@ class Master(object):
         # if the node has never been 'seen' before it needs the Master's key
         # encrypt it and send it the key
         if not node.seen:
-            print '[Info] Node has not been seen before, sending it the Master Pub Key'
+            logger.info('Node has not been seen before, sending it the Master Pub Key')
             pub_key = self.pub_key
             #twisted.bannana doesnt handle large ints very well
             #we'll encode it with json and split it up into chunks
@@ -375,7 +386,7 @@ class Master(object):
         """ 
         Called when a call to initialize a Node is successful
         """
-        print '[Info] node:%s - ready' % node
+        logger.info('node:%s - ready' % node)
 
         # if there is a public key from the node, unpack it and save it
         if result:
@@ -406,13 +417,13 @@ class Master(object):
         """
         # worker is working and it was the master for its task
         if result[0] == WORKER_STATUS_WORKING:
-            print '[info] worker:%s - is still working' % worker_key
+            logger.info('worker:%s - is still working' % worker_key)
             #record what the worker is working on
             #self._workers_working[worker_key] = task_key
 
         # worker is finished with a task
         elif result[0] == WORKER_STATUS_FINISHED:
-            print '[info] worker:%s - was finished, requesting results' % worker_key
+            logger.info('worker:%s - was finished, requesting results' % worker_key)
             #record what the worker is working on
             #self._workers_working[worker_key] = task_key
 
@@ -433,7 +444,7 @@ class Master(object):
                 # worker shouldn't already be in the idle queue but check anyway
                 if not worker_key in self._workers_idle:
                     self._workers_idle.append(worker_key)
-                    print '[info] worker:%s - added to idle workers' % worker_key
+                    logger.info('worker:%s - added to idle workers' % worker_key)
 
 
     def remove_worker(self, worker_key):
@@ -443,7 +454,7 @@ class Master(object):
         with self._lock:
             # if idle, just remove it.  no need to do anything else
             if worker_key in self._workers_idle:
-                print '[info] worker:%s - removing worker from idle pool' % worker_key
+                logger.info('worker:%s - removing worker from idle pool' % worker_key)
                 self._workers_idle.remove(worker_key)
 
             #worker was working on a task, need to clean it up
@@ -452,7 +463,7 @@ class Master(object):
 
                 #worker was working on a subtask, return unfinished work to main worker
                 if removed_worker[3]:
-                    print '[warning] %s failed during task, returning work unit' % worker_key
+                    logger.warning('%s failed during task, returning work unit' % worker_key)
                     task_instance = TaskInstance.objects.get(id=removed_worker[0])
                     main_worker = self.workers[task_instance.worker]
                     if main_worker:
@@ -511,7 +522,7 @@ class Master(object):
         information in the database.  If the cluster has idle resources it will start the task
         immediately, otherwise it will queue the task until it is ready.
         """
-        print '[info] Task:%s:%s - Queued' % (task_key, subtask_key)
+        logger.info('Task:%s:%s - Queued:  %s' % (task_key, subtask_key, args))
 
         #create a TaskInstance instance and save it
         task_instance = TaskInstance()
@@ -535,25 +546,26 @@ class Master(object):
         send signals to all workers assigned to it to stop work immediately.
         """
         task_instance = TaskInstance.objects.get(id=task_id)
-        print '[info] Cancelling Task: %s' % task_id
+        logger.info('Cancelling Task: %s' % task_id)
         with self._lock_queue:
             if task_instance in self._queue:
                 #was still in queue
                 self._queue.remove(task_instance)
-                print '[debug] Cancelling Task, was in queue: %s' % task_id
+                logger.debug('Cancelling Task, was in queue: %s' % task_id)
             else:
-                print '[debug] Cancelling Task, is running: %s' % task_id
+                logger.debug('Cancelling Task, is running: %s' % task_id)
                 #get all the workers to stop
                 for worker_key, worker_task in self._workers_working.items():
                     if worker_task[0] == task_id:
                         worker = self.workers[worker_key]
-                        print '[debug] signalling worker to stop: %s' % worker_key
+                        logger.debug('signalling worker to stop: %s' % worker_key)
                         worker.remote.callRemote('stop_task')
 
                 self._running.remove(task_instance)
 
-            task_instance.completion_type=-1
+            task_instance.completion_type = STATUS_CANCELLED
             task_instance.save()
+
             return 1
 
 
@@ -562,20 +574,21 @@ class Master(object):
         Advances the queue.  If there is a task waiting it will be started, otherwise the cluster will idle.
         This should be called whenever a resource becomes available or a new task is queued
         """
-        print '[debug] advancing queue: %s' % self._queue
+        logger.debug('advancing queue: %s' % self._queue)
         with self._lock_queue:
             try:
                 task_instance = self._queue[0]
 
             except IndexError:
                 #if there was nothing in the queue then fail silently
-                print '[debug] No tasks in queue, idling'
+                logger.debug('No tasks in queue, idling')
                 return False
 
             if self.run_task(task_instance.id, task_instance.task_key, simplejson.loads(task_instance.args), task_instance.subtask_key):
                 #task started, update its info and remove it from the queue
-                print '[info] Task:%s:%s - starting' % (task_instance.task_key, task_instance.subtask_key)
+                logger.info('Task:%s:%s - starting' % (task_instance.task_key, task_instance.subtask_key))
                 task_instance.started = datetime.datetime.now()
+                task_instance.completion_type = STATUS_RUNNING
                 task_instance.save()
 
                 del self._queue[0]
@@ -584,7 +597,7 @@ class Master(object):
             else:
                 # cluster does not have idle resources.
                 # task will stay in the queue
-                print '[debug] Task:%s:%s - no resources available, remaining in queue' % (task_instance.task_key, task_instance.subtask_key)
+                logger.debug('Task:%s:%s - no resources available, remaining in queue' % (task_instance.task_key, task_instance.subtask_key))
                 return False
 
 
@@ -605,17 +618,17 @@ class Master(object):
         available_workers = len(self._workers_idle)+1
 
         if worker:
-            print '[debug] Worker:%s - Assigned to task: %s:%s %s' % (worker.name, task_key, subtask_key, args)
+            logger.debug('Worker:%s - Assigned to task: %s:%s %s' % (worker.name, task_key, subtask_key, args))
             d = worker.remote.callRemote('run_task', task_key, args, subtask_key, workunit_key, available_workers)
             d.addCallback(self.run_task_successful, worker, task_instance_id, subtask_key)
-            return 1
+            return worker
 
         # no worker was available
         # just return 0 (false), the calling function will decided what to do,
         # depending what called run_task, different error handling will apply
         else:
-            print '[warning] No worker available'
-            return 0
+            logger.warning('No worker available')
+            return None
 
     def run_task_successful(self, results, worker, task_instance_id, subtask_key=None):
 
@@ -638,10 +651,10 @@ class Master(object):
 
             Tasks runtime and log should be saved in the database
         """
-        print '[debug] Worker:%s - sent results: %s' % (worker_key, results)
+        logger.debug('Worker:%s - sent results: %s' % (worker_key, results))
         with self._lock:
             task_instance_id, task_key, args, subtask_key, workunit_key = self._workers_working[worker_key]
-            print '[info] Worker:%s - completed: %s:%s (%s)' % (worker_key, task_key, subtask_key, workunit_key)
+            logger.info('Worker:%s - completed: %s:%s (%s)' % (worker_key, task_key, subtask_key, workunit_key))
 
             # release the worker back into the idle pool
             # this must be done before informing the 
@@ -655,8 +668,8 @@ class Master(object):
             if not subtask_key:
                 with self._lock_queue:
                     task_instance = TaskInstance.objects.get(id=task_instance_id)
-                    task_instance.completed = time.strftime('%Y-%m-%d %H:%M:%S')
-                    task_instance.completion_type = 1
+                    task_instance.completed = datetime.datetime.now()
+                    task_instance.completion_type = STATUS_COMPLETE
                     task_instance.save()
 
                     #remove task instance from running queue
@@ -676,11 +689,113 @@ class Master(object):
                     #if this was a subtask the main task needs the results and to be informed
                     task_instance = TaskInstance.objects.get(id=task_instance_id)
                     main_worker = self.workers[task_instance.worker]
-                    print '[debug] Worker:%s - informed that subtask completed' % 'FOO'
+                    logger.debug('Worker:%s - informed that subtask completed' % 'FOO')
                     main_worker.remote.callRemote('receive_results', results, subtask_key, workunit_key)
 
         #attempt to advance the queue
         self.advance_queue()
+
+
+    def task_failed(self, worker_key, results, workunit_key):
+        """
+        Called by workers when the task they were running throws an exception
+        """
+        with self._lock:
+            task_instance_id, task_key, args, subtask_key, workunit_key = self._workers_working[worker_key]
+            logger.info('Worker:%s - failed: %s:%s (%s)' % (worker_key, task_key, subtask_key, workunit_key))
+
+
+            # cancel the task and send notice to all other workers to stop
+            # working on this task.  This may be partially recoverable but that
+            # is not included for now.
+            with self._lock_queue:
+
+                # release the worker back into the idle pool
+                del self._workers_working[worker_key]
+                self._workers_idle.append(worker_key)
+
+                task_instance = TaskInstance.objects.get(id=task_instance_id)
+                task_instance.completed = datetime.datetime.now()
+                task_instance.completion_type = STATUS_FAILED
+                task_instance.save()
+
+                for worker_key, worker_task in self._workers_working.items():
+                    if worker_task[0] == task_instance_id:
+                        worker = self.workers[worker_key]
+                        logger.debug('signalling worker to stop: %s' % worker_key)
+                        worker.remote.callRemote('stop_task')
+
+                #remove task instance from running queue
+                try:
+                    self._running.remove(task_instance)
+                except ValueError:
+                    # was already removed
+                    pass
+
+        #attempt to advance the queue
+        self.advance_queue()
+
+    def fetch_task_status(self):
+        """
+        updates the list of statuses.  this function is used because all
+        workers must be queried to receive status updates.  This results in a
+        list of deferred objects.  There is no way to block until the results
+        are ready.  instead this function updates all the statuses.  Subsequent
+        calls for status will be able to fetch the status.  It may be delayed 
+        by a few seconds but thats minor when considering a task that could run
+        for hours.
+        """
+
+        # limit updates so multiple controllers won't cause excessive updates
+        now = datetime.datetime.now()
+        if self._next_task_status_update < now:
+            workers = self.workers
+            for key, data in self._workers_working.items():
+                worker = workers[key]
+                task_instance_id = data[0]
+                deferred = worker.remote.callRemote('task_status')
+                deferred.addCallback(self.fetch_task_status_success, task_instance_id)
+            self.next_task_status_update = now + datetime.timedelta(0, 3)
+
+
+    def fetch_task_status_success(self, result, task_instance_id):
+        """
+        updates task status list with response from worker used in conjunction
+        with fetch_task_status()
+        """
+        self._task_statuses[task_instance_id] = result
+
+
+    def task_statuses(self):
+        """
+        Returns the status of all running tasks.  This is a detailed list
+        of progress and status messages.
+        """
+
+        # tell the master to fetch the statuses for the task.
+        # this may or may not complete by the time we process the list
+        self.fetch_task_status()
+
+        statuses = {}
+        for instance in self._queue:
+            statuses[instance.id] = {'s':STATUS_STOPPED}
+
+        for instance in self._running:
+            start = time.mktime(instance.started.timetuple())
+
+            # call worker to get status update
+            try:
+                progress = self._task_statuses[instance.id]
+
+            except KeyError:
+                # its possible that the progress does not exist yet. because
+                # the task has just started and fetch_task_status is not complete
+                pass
+                progress = -1
+
+            statuses[instance.id] = {'s':STATUS_RUNNING, 't':start, 'p':progress}
+
+        return statuses
 
 
     def worker_stopped(self, worker_key):
@@ -688,7 +803,7 @@ class Master(object):
         Called by workers when they have stopped due to a cancel task request.
         """
         with self._lock:
-            print '[info] Worker:%s - stopped' % worker_key
+            logger.info(' Worker:%s - stopped' % worker_key)
 
             # release the worker back into the idle pool
             # this must be done before informing the 
@@ -710,10 +825,9 @@ class Master(object):
         #get the task key and run the task.  The key is looked up
         #here so that a worker can only request a worker for the 
         #their current task.
-        print self._workers_working
         worker = self._workers_working[workerAvatar.name]
         task_instance = TaskInstance.objects.get(id=worker[0])
-        print '[debug] Worker:%s - request for worker: %s:%s' % (workerAvatar.name, subtask_key, args)
+        logger.debug('Worker:%s - request for worker: %s:%s' % (workerAvatar.name, subtask_key, args))
 
         # lock queue and check status of task to ensure no lost workers
         # due to a canceled task
@@ -722,7 +836,7 @@ class Master(object):
                 self.run_task(worker[0], worker[1], args, subtask_key, workunit_key)
 
             else:
-                print '[debug] Worker:%s - request for worker failed, task is not running' % (workerAvatar.name)
+                logger.debug('Worker:%s - request for worker failed, task is not running' % (workerAvatar.name))
 
 
 
@@ -738,14 +852,14 @@ class MasterRealm:
             avatar = ControllerAvatar(avatarID)
             avatar.server = self.server
             avatar.attached(mind)
-            print '[info] controller:%s - connected' % avatarID
+            logger.info('controller:%s - connected' % avatarID)
 
         else:
             key_split = avatarID.split(':')
             node = Node.objects.get(host=key_split[0], port=key_split[1])
             avatar = WorkerAvatar(avatarID, self.server, node)
             avatar.attached(mind)
-            print '[info] worker:%s - connected' % avatarID
+            logger.info('worker:%s - connected' % avatarID)
 
         return pb.IPerspective, avatar, lambda a=avatar:a.detached(mind)
 
