@@ -19,8 +19,15 @@
 
 from heapq import heappush, heappop, heapify
 import time
+import logging
+
+from twisted.internet import reactor
 
 from pydra_server.cluster.tasks import tasks
+
+logger = logging.getLogger('sched')
+
+# TODO make this module thread-safe (with Twisted)
 
 
 class TaskExecutionRecord:
@@ -31,7 +38,7 @@ class TaskExecutionRecord:
         # properties that could be decisive in scheduling
         self.priority = 5
         self.scheduled = False
-        self.running_workers = 0 # how many workers this task has already got
+        self.workers = [] # workers allocated to this task (only keys)
         self.started_time = None # for how long this task has been run
         self.last_succ_time = None # when this task last time gets a worker
         self.worker_requests = [] # (args, subtask_key, args, workunit_key)
@@ -65,17 +72,30 @@ class Scheduler:
     started from the master.
     """
 
-    def __init__(self):
+    def __init__(self, listener=None):
         self._long_term_queue = []
         self._short_term_queue = []
         self._task_records = {} # scheduling decision reference
         self._idle_workers = [] # all workers are seen equal
 
-        self._listeners = []
+        # how workers are allocated to tasks.
+        # the key is the worker key, and the value is a tuple of
+        # (root_task_id, root_task_key, args, subtask_key, workunit_key).
+        self._worker_mappings = {} 
+
+        self._listeners = if listener [listener] else []
+
+        self.update_interval = 5 # seconds
+
+        reactor.callInThread(self._update_queue, self)
 
 
     def attach_listener(listener):
-        self._listeners.append(listener)
+        if hasattr(listener, 'worker_scheduled') and hasattr(listener,
+                'worker_released'):
+            self._listeners.append(listener)
+        else:
+            logger.warn('Ignored to attach an invalid listener')           
 
 
     def add_task(self, task):
@@ -94,81 +114,123 @@ class Scheduler:
         if self._idle_workers:
             # put this task to the shor-term queue immediately
             record.scheduled = True
-            heappush(self._short_term_queue, (record.compute_score(), task.id))
+            heappush(self._short_term_queue, [record.compute_score(), task.id])
             self._notify(self._idle_workers.pop(), task.id)
         else:
-            heappush(self._long_term_queue, (record.compute_score(), task.id))
+            heappush(self._long_term_queue, [record.compute_score(), task.id])
 
 
     def remove_task(self, root_task_id):
         """
         Removes a task from the queue.
        
-        This method MUST be called after the master has successfully stopped
+        This method MUST be called AFTER the master has successfully stopped
         the task. Essentially, it collects the workers possesed by a cancelled
-        task and returns them to the idle pool. The implementation is
-        inefficient, so use with caution.
+        task and returns them to the idle pool.
         """
-        record = self._task_records.get(task.id, None)
+        record = self._task_records.get(root_task_id, None)
         if record:
             if record.scheduled:
-                # how to cleanup
-                self._short_term_queue.remove(task.id)
+                for worker_key in record.workers:
+                    del self._worker_mappings[worker_key]
+                    self.add_worker(worker_key) # no need to pass the owner task
+                for task in self._short_term_queue:
+                    if task[1] == root_task_id:
+                        self._short_term_queue.remove(task)
+                    break
                 heapify(self._short_term_queue)
             else:
-                self._long_term_queue.remove(task.id)
+                for task in self._long_term_queue:
+                    if task[1] == root_task_id:
+                        self._short_long_queue.remove(task)
+                    break
                 heapify(self._long_term_queue)
+            del self._task_records[root_task_id]
 
 
-    def add_worker(self, worker, owner_task_id=None):
+    def add_worker(self, worker_key, owner_task_id=None):
         """
         Adds a worker to the idle pool.
 
         Two possible calling situations: 1) a new worker joins; and 2) a worker
         previously working on a work unit is returned to the pool.
         """
+        if worker_key in self._workers_idle:
+            logger.warn('Ignored a worker that is already in the pool: %s' %
+                    worker_key)
+            
         if owner_task_id:
             record = self._task_records.get(owner_task_id, None)
             if record:
-                record.running_workers -= 1
+                record.workers.remove(worker_key)
+
+        running_task = self._worker_mapping.get(worker_key, None):
+        if running_task:
+            logger.info('Task %d gives back a worker: %s' % (running_task[0],
+                        worker_key))
+            del self._worker_mapping[worker_key]
 
         if self._long_term_queue:
             # satisfy long-term tasks first to guarantee their completion
-            task_id = heappop(self._long_term_queue)
+            task_id = heappop(self._long_term_queue)[1]
             record = self._task_records[task_id]
             # move it to the short-term queue
         elif self._short_term_queue:
-            task_id = self._short_term_queue[0]
+            task_id = self._short_term_queue[1]
             record = self._task_records[task_id]
             if record.worker_requests:
                 request = record.worker_requests.pop()
+                # dispatch a work unit
             else:
                 # can we reach here?
                 pass
         else:
             self._idle_workers.append(worker)
+            logger.info('worker:%s - added to idle workers' % worker_key)
+
+
+    def remove_worker(self, worker_key):
+        pass
 
 
     def request_worker(self, root_task_id, args, subtask_key, workunit_key):
         record = self._task_records.get(root_task_id, None)
         if record:
             if self._idle_workers:
-                worker = self._idle_workers.pop()
-                self._notify_listeners(worker, record.task_id, record.task_key,
+                self._allocate_worker(record.task_id, record.task_key,
                         args, subtask_key, workunit_key)
             else:
-                # no available workers; increment the request count
                 record.worker_requests.append( (args, subtask_key, workunit_key) )
         else:
-            # worker request from an unknown task
+            # a worker request from an unknown task
             return None
 
 
-    def _notify(self, worker_key, root_task_id, task_key, args, subtask_key=None,
-            workunit_key=None):
-        record =  self._task_records[task_id]
+    # TODO this should be a non-blocking call
+    def _allocate_worker(self, root_task_id, root_task_key, args,
+            subtask_key=None, workunit_key=None):
+        record = self._task_records[root_task_id]
         record.last_succ_time = time.time()
         record.running_workers += 1
+
+        worker_key = self._idle_workers.pop()
+        self._worker_mappings[worker_key] = (root_task_id, root_task_key, args,
+                subtask_key, workunit_key)
+ 
         for l in self._listeners:
             l.worker_scheduled(worker_key, args, subtask_key, workunit_key)
+
+
+    def _update_queue(self):
+        for task in self._long_term_queue:
+            record = self._task_records[task_id[1]]
+            task[0] = record.compute_score()
+        heapify(self._long_term_queue)
+
+        for task in self._long_term_queue:
+            record = self._task_records[task_id[1]]
+            task[0] = record.compute_score()
+        heapify(self._short_term_queue)
+            
+        time.sleep(self.update_interval)
 

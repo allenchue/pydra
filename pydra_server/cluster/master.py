@@ -144,7 +144,7 @@ class Master(object):
 
         self.host = 'localhost'
         self.port = 18800
-        self.scheduler = Scheduler()
+        self.scheduler = Scheduler(this)
 
     def get_services(self):
         """
@@ -441,10 +441,7 @@ class Master(object):
         else:
             with self._lock:
                 self.workers[worker_key] = worker
-                # worker shouldn't already be in the idle queue but check anyway
-                if not worker_key in self._workers_idle:
-                    self._workers_idle.append(worker_key)
-                    logger.info('worker:%s - added to idle workers' % worker_key)
+                self.scheduler.add_worker(worker_key)
 
 
     def remove_worker(self, worker_key):
@@ -531,10 +528,7 @@ class Master(object):
         task_instance.args = simplejson.dumps(args)
         task_instance.save()
 
-        #queue the task and signal attempt to start it
-        with self._lock_queue:
-            self._queue.append(task_instance)
-        self.advance_queue()
+        self.scheduler.add_task(task)
 
         return task_instance
 
@@ -660,8 +654,7 @@ class Master(object):
             # this must be done before informing the 
             # main worker.  otherwise a new work request
             # can be made before the worker is released
-            del self._workers_working[worker_key]
-            self._workers_idle.append(worker_key)
+            self.scheduler.add_worker(worker_key, task_instance_id)
 
             #if this was the root task for the job then save info.  Ignore the fact that the task might have
             #been canceled.  If its 100% complete, then mark it as such.
@@ -809,11 +802,7 @@ class Master(object):
             # this must be done before informing the 
             # main worker.  otherwise a new work request
             # can be made before the worker is released
-            del self._workers_working[worker_key]
-            self._workers_idle.append(worker_key)
-
-        #attempt to advance the queue
-        self.advance_queue()
+            self.scheduler.add_worker(worker_key)
 
 
     def request_worker(self, workerAvatar, subtask_key, args, workunit_key):
@@ -838,6 +827,12 @@ class Master(object):
             else:
                 logger.debug('Worker:%s - request for worker failed, task is not running' % (workerAvatar.name))
 
+
+    def worker_scheduled(self, worker_key, root_task_id, task_key, args,
+            subtask_key=None, workunit_key=None):
+        worker = self.workers[worker_key]
+        d = worker.remote.callRemote('run_task', task_key, args, subtask_key, workunit_key, available_workers)
+        d.addCallback(self.run_task_successful, worker, task_instance_id, subtask_key)
 
 
 class MasterRealm:

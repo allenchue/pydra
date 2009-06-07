@@ -449,13 +449,8 @@ class ParallelTask(Task):
     def __init__(self, subtask, msg=None):
         Task.__init__(self, msg)
         self.subtask = subtask
+        self.subtask = self
         self._lock = Lock()
-
-    def __setattr__(self, key, value):
-        Task.__setattr__(self, key, value)
-        if key == 'subtask':
-            value.parent = self
-
 
 
     def work(self, args, callback, callback_args={}):
