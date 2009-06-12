@@ -121,11 +121,24 @@ class TaskInstance(models.Model):
     task_key        = models.CharField(max_length=255)
     subtask_key     = models.CharField(max_length=255, null=True)
     args            = models.TextField(null=True)
-    queued          = models.DateTimeField(auto_now_add=True)
-    started         = models.DateTimeField(null=True)
+    queued_time     = models.DateTimeField(auto_now_add=True)
+    started_time    = models.DateTimeField(null=True)
     completed       = models.DateTimeField(null=True)
     worker          = models.CharField(max_length=255, null=True)
-    completion_type = models.IntegerField(null=True)
+    status          = models.IntegerField(null=True)
+
+    ######################
+    # non-model attributes
+    ######################
+
+    # scheduling-related
+    priority        = 5
+    workers         = [] # workers allocated to this task (only keys)
+    last_succ_time  = None # when this task last time gets a worker
+    worker_requests = [] # (args, subtask_key, args, workunit_key)
+
+    # others
+    primary_worker  = None
 
     objects = TaskInstanceManager()
 
@@ -134,3 +147,20 @@ class TaskInstance(models.Model):
             ("can_run", "Can run tasks on the cluster"),
             ("can_stop_all", "Can stop anyone's tasks")
         )
+
+    def compute_score(self):
+        """
+        Computes a priority score for this task, which will be used by the
+        scheduler.
+
+        Empirical analysis may reveal a good calculation formula. But in
+        general, the following guideline is useful:
+        1) Stopped tasks should have higher scores. At least for the current
+           design, a task can well proceed even with only one worker. So letting
+           a stopped task run ASAP makes sense.
+        2) A task with higher priority should obviously have a higher score.
+        3) A task that has been out of worker supply for a long time should
+           have a relatively higher score.
+        """
+        return self.priority 
+

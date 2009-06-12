@@ -450,16 +450,15 @@ class Master(object):
         """
         with self._lock:
             # if idle, just remove it.  no need to do anything else
-            if worker_key in self._workers_idle:
+            job = self.scheduler.get_worker_job(worker_key)
+            if job is None:
                 logger.info('worker:%s - removing worker from idle pool' % worker_key)
-                self._workers_idle.remove(worker_key)
+                self.scheduler.remove_worker(worker_key)
 
             #worker was working on a task, need to clean it up
             else:
-                removed_worker = self._workers_working[worker_key]
-
                 #worker was working on a subtask, return unfinished work to main worker
-                if removed_worker[3]:
+                if job[3]:
                     logger.warning('%s failed during task, returning work unit' % worker_key)
                     task_instance = TaskInstance.objects.get(id=removed_worker[0])
                     main_worker = self.workers[task_instance.worker]
@@ -486,7 +485,7 @@ class Master(object):
         Work was sucessful returned to the main worker
         """
         with self._lock:
-            del self._workers_working[worker_key]
+            self.scheduler.remove_worker(worker_key)
 
 
     def return_work_failed(self, results, worker_key):
@@ -513,24 +512,13 @@ class Master(object):
                 return None
 
 
-    def queue_task(self, task_key, args={}, subtask_key=None):
+    def queue_task(self, task_key, args={}, priority=5):
         """
         Queue a task to be run.  All task requests come through this method.  It saves their
         information in the database.  If the cluster has idle resources it will start the task
         immediately, otherwise it will queue the task until it is ready.
         """
-        logger.info('Task:%s:%s - Queued:  %s' % (task_key, subtask_key, args))
-
-        #create a TaskInstance instance and save it
-        task_instance = TaskInstance()
-        task_instance.task_key = task_key
-        task_instance.subtask_key = subtask_key
-        task_instance.args = simplejson.dumps(args)
-        task_instance.save()
-
-        self.scheduler.add_task(task)
-
-        return task_instance
+        return self.scheduler.add_task(task_key, args, priority)
 
 
     def cancel_task(self, task_id):
@@ -557,7 +545,7 @@ class Master(object):
 
                 self._running.remove(task_instance)
 
-            task_instance.completion_type = STATUS_CANCELLED
+            task_instance.status = STATUS_CANCELLED
             task_instance.save()
 
             return 1
@@ -582,7 +570,7 @@ class Master(object):
                 #task started, update its info and remove it from the queue
                 logger.info('Task:%s:%s - starting' % (task_instance.task_key, task_instance.subtask_key))
                 task_instance.started = datetime.datetime.now()
-                task_instance.completion_type = STATUS_RUNNING
+                task_instance.status = STATUS_RUNNING
                 task_instance.save()
 
                 del self._queue[0]
@@ -662,7 +650,7 @@ class Master(object):
                 with self._lock_queue:
                     task_instance = TaskInstance.objects.get(id=task_instance_id)
                     task_instance.completed = datetime.datetime.now()
-                    task_instance.completion_type = STATUS_COMPLETE
+                    task_instance.status = STATUS_COMPLETE
                     task_instance.save()
 
                     #remove task instance from running queue
@@ -709,7 +697,7 @@ class Master(object):
 
                 task_instance = TaskInstance.objects.get(id=task_instance_id)
                 task_instance.completed = datetime.datetime.now()
-                task_instance.completion_type = STATUS_FAILED
+                task_instance.status = STATUS_FAILED
                 task_instance.save()
 
                 for worker_key, worker_task in self._workers_working.items():
@@ -814,18 +802,13 @@ class Master(object):
         #get the task key and run the task.  The key is looked up
         #here so that a worker can only request a worker for the 
         #their current task.
-        worker = self._workers_working[workerAvatar.name]
-        task_instance = TaskInstance.objects.get(id=worker[0])
         logger.debug('Worker:%s - request for worker: %s:%s' % (workerAvatar.name, subtask_key, args))
 
         # lock queue and check status of task to ensure no lost workers
         # due to a canceled task
         with self._lock_queue:
-            if task_instance in self._running:
-                self.run_task(worker[0], worker[1], args, subtask_key, workunit_key)
-
-            else:
-                logger.debug('Worker:%s - request for worker failed, task is not running' % (workerAvatar.name))
+            self.scheduler.request_worker(worker_key, root_task_id, args,
+                    subtask_key, workunit_key)
 
 
     def worker_scheduled(self, worker_key, root_task_id, task_key, args,
