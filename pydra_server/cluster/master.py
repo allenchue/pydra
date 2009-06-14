@@ -112,11 +112,6 @@ class Master(object):
         self.pub_key, self.priv_key = load_crypto('./master.key')
         self.rsa_client = RSAClient(self.priv_key, callback=self.init_node)
 
-        #load tasks queue
-        self._running = list(TaskInstance.objects.running())
-        self._running_workers = {}
-        self._queue = list(TaskInstance.objects.queued())
-
         #task statuses
         self._task_statuses = {}
         self._next_task_status_update = datetime.datetime.now()
@@ -124,8 +119,6 @@ class Master(object):
         #cluster management
         self.workers = {}
         self.nodes = self.load_nodes()
-        self._workers_idle = []
-        self._workers_working = {}
 
         #connection management
         self.connecting = True
@@ -623,8 +616,13 @@ class Master(object):
 
         else:
             task_instance = TaskInstance.objects.get(id=task_instance_id)
-            task_instance.worker = worker.name
+            task_instance.worker = worker_key
             task_instance.save()
+
+
+    def run_task_failed(self, worker_key):
+        # return the worker to the pool
+        self.scheduler.add_worker(worker_key)
 
 
     def send_results(self, worker_key, results, workunit_key):
@@ -682,9 +680,10 @@ class Master(object):
         Called by workers when the task they were running throws an exception
         """
         with self._lock:
-            task_instance_id, task_key, args, subtask_key, workunit_key = self._workers_working[worker_key]
-            logger.info('Worker:%s - failed: %s:%s (%s)' % (worker_key, task_key, subtask_key, workunit_key))
-
+            job = self.scheduler.get_worker_job(worker_key)
+            if job is not None:
+            logger.info('Worker:%s - failed: %s:%s (%s)' % (worker_key,
+                        job[1], job[3], job[4]))
 
             # cancel the task and send notice to all other workers to stop
             # working on this task.  This may be partially recoverable but that
@@ -815,7 +814,8 @@ class Master(object):
             subtask_key=None, workunit_key=None):
         worker = self.workers[worker_key]
         d = worker.remote.callRemote('run_task', task_key, args, subtask_key, workunit_key, available_workers)
-        d.addCallback(self.run_task_successful, worker, task_instance_id, subtask_key)
+        d.addCallback(self.run_task_successful, worker_key, task_instance_id, subtask_key)
+        d.addErrCallback(self.run_task_failed, worker, task_instance_id, subtask_key)
 
 
 class MasterRealm:

@@ -22,6 +22,8 @@ from django.db import models
 import dbsettings
 from dbsettings.loading import set_setting_value
 
+from threading import Lock
+
 
 """ ================================
 Settings
@@ -133,12 +135,13 @@ class TaskInstance(models.Model):
 
     # scheduling-related
     priority        = 5
-    workers         = [] # workers allocated to this task (only keys)
+    workers         = [] # workers allocated (keys only, excluding the main worker)
     last_succ_time  = None # when this task last time gets a worker
-    worker_requests = [] # (args, subtask_key, args, workunit_key)
+    _worker_requests = [] # (args, subtask_key, workunit_key)
 
     # others
     primary_worker  = None
+    _request_lock = Lock()
 
     objects = TaskInstanceManager()
 
@@ -163,4 +166,12 @@ class TaskInstance(models.Model):
            have a relatively higher score.
         """
         return self.priority 
+
+    def queue_worker_request(self, request):
+        with self._request_lock:
+            self._worker_requests.append(request)
+
+    def pop_worker_request(self):
+        with self._request_lock:
+            return self._worker_requests.pop(0)
 
