@@ -58,22 +58,22 @@ class TaskManager_Test(unittest.TestCase):
             #running tasks
             task_instance = TaskInstance()
             task_instance.task_key=task
-            task_instance.started = time.strftime('%Y-%m-%d %H:%M:%S')
+            task_instance.started_time = time.strftime('%Y-%m-%d %H:%M:%S')
             task_instance.save()
 
             #finished tasks
             task_instance = TaskInstance()
             task_instance.task_key=task
-            task_instance.started = time.strftime('%Y-%m-%d %H:%M:%S')
+            task_instance.started_time = time.strftime('%Y-%m-%d %H:%M:%S')
             completed_time = time.strftime('%Y-%m-%d %H:%M:%S')
-            task_instance.completed = completed_time
+            task_instance.completed_time = completed_time
             task_instance.save()
             self.completion[task] = completed_time
 
             #failed tasks
             task_instance = TaskInstance()
             task_instance.task_key=task
-            task_instance.started = time.strftime('%Y-%m-%d %H:%M:%S')
+            task_instance.started_time = time.strftime('%Y-%m-%d %H:%M:%S')
             task_instance.completion_type = -1
             task_instance.save()
 

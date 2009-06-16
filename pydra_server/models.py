@@ -17,6 +17,8 @@
     along with Pydra.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+from __future__ import with_statement
+
 from django.db import models
 
 import dbsettings
@@ -125,7 +127,7 @@ class TaskInstance(models.Model):
     args            = models.TextField(null=True)
     queued_time     = models.DateTimeField(auto_now_add=True)
     started_time    = models.DateTimeField(null=True)
-    completed       = models.DateTimeField(null=True)
+    completed_time  = models.DateTimeField(null=True)
     worker          = models.CharField(max_length=255, null=True)
     status          = models.IntegerField(null=True)
 

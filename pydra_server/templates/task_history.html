@@ -137,9 +137,9 @@
                     <td class="task_status">{{instance.completion_type|task_status}}</td>
                     <td class="task_id">{{instance.id}}</td>
                     <td class="description"></td>
-                    <td class="queue_time">{{instance.queued|default:"--"}}</td>
-                    <td class="start_time">{{instance.started|default:"--"}}</td>
-                    <td class="completion_time">{{instance.completed|default:"--"}}</td>
+                    <td class="queue_time">{{instance.queued_time|default:"--"}}</td>
+                    <td class="start_time">{{instance.started_time|default:"--"}}</td>
+                    <td class="completion_time">{{instance.completed_time|default:"--"}}</td>
                     <td class="buttons">
                         {% if perms.pydra_server.can_run_tasks %}
                             <div class="button_rerun icon" title="Run Task"></div>

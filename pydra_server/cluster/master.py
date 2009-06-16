@@ -64,7 +64,7 @@ from pydra_server.cluster.tasks.tasks import STATUS_STOPPED, STATUS_RUNNING, STA
 from pydra_server.cluster.auth.rsa_auth import RSAClient, load_crypto
 from pydra_server.cluster.auth.worker_avatar import WorkerAvatar
 from pydra_server.cluster.amf.interface import AMFInterface
-from pydar_server.cluster.sched import Scheduler
+from pydra_server.cluster.sched import Scheduler
 
 
 # init logging
@@ -106,7 +106,6 @@ class Master(object):
 
         #locks
         self._lock = Lock()         #general lock, use when multiple shared resources are touched
-        self._lock_queue = Lock()   #for access to _queue
 
         #load rsa crypto
         self.pub_key, self.priv_key = load_crypto('./master.key')
@@ -137,7 +136,7 @@ class Master(object):
 
         self.host = 'localhost'
         self.port = 18800
-        self.scheduler = Scheduler(this)
+        self.scheduler = Scheduler(self)
 
     def get_services(self):
         """
@@ -453,10 +452,12 @@ class Master(object):
                 #worker was working on a subtask, return unfinished work to main worker
                 if job[3]:
                     logger.warning('%s failed during task, returning work unit' % worker_key)
-                    task_instance = TaskInstance.objects.get(id=removed_worker[0])
-                    main_worker = self.workers[task_instance.worker]
+                    task_instance = self.scheduler.get_task_instance(removed_worker[0])
+                    main_worker = self.workers.get(task_instance.primary_worker,
+                            None)
                     if main_worker:
-                        d = main_worker.remote.callRemote('return_work', removed_worker[3], removed_worker[4])
+                        d = main_worker.remote.callRemote('return_work', job[3],
+                                job[4])
                         d.addCallback(self.return_work_success, worker_key)
                         d.addErrback(self.return_work_failed, worker_key)
 
@@ -488,23 +489,6 @@ class Master(object):
         pass
 
 
-    def select_worker(self, task_instance_id, task_key, args={}, subtask_key=None, workunit_key=None):
-        """
-        Select a worker to use for running a task or subtask
-        """
-        #lock, selecting workers must be threadsafe
-        with self._lock:
-            if len(self._workers_idle):
-                #move the first worker to the working state storing the task its working on
-                worker_key = self._workers_idle.pop(0)
-                self._workers_working[worker_key] = (task_instance_id, task_key, args, subtask_key, workunit_key)
-
-                #return the worker object, not the key
-                return self.workers[worker_key]
-            else:
-                return None
-
-
     def queue_task(self, task_key, args={}, priority=5):
         """
         Queue a task to be run.  All task requests come through this method.  It saves their
@@ -520,104 +504,20 @@ class Master(object):
         If the task is in the queue still, remove it.  If it is running then
         send signals to all workers assigned to it to stop work immediately.
         """
-        task_instance = TaskInstance.objects.get(id=task_id)
+        task_instance = self.scheduler.get_task_instance(task_id)
         logger.info('Cancelling Task: %s' % task_id)
-        with self._lock_queue:
-            if task_instance in self._queue:
-                #was still in queue
-                self._queue.remove(task_instance)
-                logger.debug('Cancelling Task, was in queue: %s' % task_id)
-            else:
-                logger.debug('Cancelling Task, is running: %s' % task_id)
-                #get all the workers to stop
-                for worker_key, worker_task in self._workers_working.items():
-                    if worker_task[0] == task_id:
-                        worker = self.workers[worker_key]
-                        logger.debug('signalling worker to stop: %s' % worker_key)
-                        worker.remote.callRemote('stop_task')
-
-                self._running.remove(task_instance)
-
-            task_instance.status = STATUS_CANCELLED
-            task_instance.save()
-
-            return 1
-
-
-    def advance_queue(self):
-        """
-        Advances the queue.  If there is a task waiting it will be started, otherwise the cluster will idle.
-        This should be called whenever a resource becomes available or a new task is queued
-        """
-        logger.debug('advancing queue: %s' % self._queue)
-        with self._lock_queue:
-            try:
-                task_instance = self._queue[0]
-
-            except IndexError:
-                #if there was nothing in the queue then fail silently
-                logger.debug('No tasks in queue, idling')
-                return False
-
-            if self.run_task(task_instance.id, task_instance.task_key, simplejson.loads(task_instance.args), task_instance.subtask_key):
-                #task started, update its info and remove it from the queue
-                logger.info('Task:%s:%s - starting' % (task_instance.task_key, task_instance.subtask_key))
-                task_instance.started = datetime.datetime.now()
-                task_instance.status = STATUS_RUNNING
-                task_instance.save()
-
-                del self._queue[0]
-                self._running.append(task_instance)
-
-            else:
-                # cluster does not have idle resources.
-                # task will stay in the queue
-                logger.debug('Task:%s:%s - no resources available, remaining in queue' % (task_instance.task_key, task_instance.subtask_key))
-                return False
-
-
-    def run_task(self, task_instance_id, task_key, args={}, subtask_key=None, workunit_key=None):
-        """
-        Run the task specified by the task_key.  This shouldn't be called directly.  Tasks should
-        be queued with queue_task().  If the cluster has idle resources it will be run automatically
-
-        This function is used internally by the cluster for parallel processing work requests.  Work
-        requests are never queued.  If there is no resource available the main worker for the task
-        should be informed and it can readjust its count of available resources.  Any type of resource
-        sharing logic should be handled within select_worker() to keep the logic organized.
-        """
-
-        # get a worker for this task
-        worker = self.select_worker(task_instance_id, task_key, args, subtask_key, workunit_key)
-        # determine how many workers are available for this task
-        available_workers = len(self._workers_idle)+1
-
-        if worker:
-            logger.debug('Worker:%s - Assigned to task: %s:%s %s' % (worker.name, task_key, subtask_key, args))
-            d = worker.remote.callRemote('run_task', task_key, args, subtask_key, workunit_key, available_workers)
-            d.addCallback(self.run_task_successful, worker, task_instance_id, subtask_key)
-            return worker
-
-        # no worker was available
-        # just return 0 (false), the calling function will decided what to do,
-        # depending what called run_task, different error handling will apply
+        if self.scheduler.cancel_task(task_id):
+            #was still in queue
+            logger.debug('Cancelling Task, was in queue: %s' % task_id)
         else:
-            logger.warning('No worker available')
-            return None
+            logger.debug('Cancelling Task, is running: %s' % task_id)
+            #get all the workers to stop
+            for worker_key in self.scheduler.get_workers_on_task(task_id):
+                worker = self.workers[worker_key]
+                logger.debug('signalling worker to stop: %s' % worker_key)
+                worker.remote.callRemote('stop_task')
 
-    def run_task_successful(self, results, worker, task_instance_id, subtask_key=None):
-
-        #save the history of what workers work on what task/subtask
-        #its needed for tracking finished work in ParallelTasks and will aide in Fault recovery
-        #it might also be useful for analysis purposes if one node is faulty
-        if subtask_key:
-            #TODO, update model and record what workers worked on what subtasks
-            pass
-
-        else:
-            task_instance = TaskInstance.objects.get(id=task_instance_id)
-            task_instance.worker = worker_key
-            task_instance.save()
+        return 1
 
 
     def run_task_failed(self, worker_key):
@@ -633,46 +533,25 @@ class Master(object):
         """
         logger.debug('Worker:%s - sent results: %s' % (worker_key, results))
         with self._lock:
-            task_instance_id, task_key, args, subtask_key, workunit_key = self._workers_working[worker_key]
+            task_instance_id, task_key, args, subtask_key, workunit_key = self.scheduler.get_worker_job(worker_key)
             logger.info('Worker:%s - completed: %s:%s (%s)' % (worker_key, task_key, subtask_key, workunit_key))
 
             # release the worker back into the idle pool
             # this must be done before informing the 
             # main worker.  otherwise a new work request
             # can be made before the worker is released
-            self.scheduler.add_worker(worker_key, task_instance_id)
-
-            #if this was the root task for the job then save info.  Ignore the fact that the task might have
-            #been canceled.  If its 100% complete, then mark it as such.
-            if not subtask_key:
-                with self._lock_queue:
-                    task_instance = TaskInstance.objects.get(id=task_instance_id)
-                    task_instance.completed = datetime.datetime.now()
-                    task_instance.status = STATUS_COMPLETE
-                    task_instance.save()
-
-                    #remove task instance from running queue
-                    try:
-                        self._running.remove(task_instance)
-                    except ValueError:
-                        # was already removed by cancel
-                        pass
-
+            self.scheduler.add_worker(worker_key)
 
             #check to make sure the task was still in the queue.  Its possible this call was made at the same
             # time a task was being canceled.  Only worry about sending the reults back to the Task Head
             # if the task is still running
-            task_instance = TaskInstance.objects.get(id=task_instance_id)
-            with self._lock_queue:
-                if task_instance in self._running:
-                    #if this was a subtask the main task needs the results and to be informed
-                    task_instance = TaskInstance.objects.get(id=task_instance_id)
-                    main_worker = self.workers[task_instance.worker]
-                    logger.debug('Worker:%s - informed that subtask completed' % 'FOO')
-                    main_worker.remote.callRemote('receive_results', results, subtask_key, workunit_key)
-
-        #attempt to advance the queue
-        self.advance_queue()
+            task_instance = self.scheduler.get_task_instance(task_instance_id)
+            if task_instance.status == STATUS_RUNNING:
+                #if this was a subtask the main task needs the results and to be informed
+                main_worker = self.workers[task_instance.primary_worker]
+                logger.debug('Worker:%s - informed that subtask completed' %
+                        worker_key)
+                main_worker.remote.callRemote('receive_results', results, subtask_key, workunit_key)
 
 
     def task_failed(self, worker_key, results, workunit_key):
@@ -682,38 +561,18 @@ class Master(object):
         with self._lock:
             job = self.scheduler.get_worker_job(worker_key)
             if job is not None:
-            logger.info('Worker:%s - failed: %s:%s (%s)' % (worker_key,
+                logger.info('Worker:%s - failed: %s:%s (%s)' % (worker_key,
                         job[1], job[3], job[4]))
+            self.scheduler.add_worker(worker_key, STATUS_FAILED)
 
             # cancel the task and send notice to all other workers to stop
             # working on this task.  This may be partially recoverable but that
             # is not included for now.
-            with self._lock_queue:
+            for worker_key in self.scheduler.get_workers_on_task(job[0]):
+                worker = self.workers[worker_key]
+                logger.debug('signalling worker to stop: %s' % worker_key)
+                worker.remote.callRemote('stop_task')
 
-                # release the worker back into the idle pool
-                del self._workers_working[worker_key]
-                self._workers_idle.append(worker_key)
-
-                task_instance = TaskInstance.objects.get(id=task_instance_id)
-                task_instance.completed = datetime.datetime.now()
-                task_instance.status = STATUS_FAILED
-                task_instance.save()
-
-                for worker_key, worker_task in self._workers_working.items():
-                    if worker_task[0] == task_instance_id:
-                        worker = self.workers[worker_key]
-                        logger.debug('signalling worker to stop: %s' % worker_key)
-                        worker.remote.callRemote('stop_task')
-
-                #remove task instance from running queue
-                try:
-                    self._running.remove(task_instance)
-                except ValueError:
-                    # was already removed
-                    pass
-
-        #attempt to advance the queue
-        self.advance_queue()
 
     def fetch_task_status(self):
         """
@@ -789,7 +648,7 @@ class Master(object):
             # this must be done before informing the 
             # main worker.  otherwise a new work request
             # can be made before the worker is released
-            self.scheduler.add_worker(worker_key)
+            self.scheduler.add_worker(worker_key, STATUS_CANCELLED)
 
 
     def request_worker(self, workerAvatar, subtask_key, args, workunit_key):
@@ -803,18 +662,14 @@ class Master(object):
         #their current task.
         logger.debug('Worker:%s - request for worker: %s:%s' % (workerAvatar.name, subtask_key, args))
 
-        # lock queue and check status of task to ensure no lost workers
-        # due to a canceled task
-        with self._lock_queue:
-            self.scheduler.request_worker(worker_key, root_task_id, args,
-                    subtask_key, workunit_key)
+        self.scheduler.request_worker(worker_key, root_task_id, args,
+                subtask_key, workunit_key)
 
 
     def worker_scheduled(self, worker_key, root_task_id, task_key, args,
             subtask_key=None, workunit_key=None):
         worker = self.workers[worker_key]
         d = worker.remote.callRemote('run_task', task_key, args, subtask_key, workunit_key, available_workers)
-        d.addCallback(self.run_task_successful, worker_key, task_instance_id, subtask_key)
         d.addErrCallback(self.run_task_failed, worker, task_instance_id, subtask_key)
 
 

@@ -110,7 +110,7 @@ class TaskManager():
 
         for key in keys:
             try:
-                last_run_instance = TaskInstance.objects.filter(task_key=key).exclude(completed=None).order_by('-completed').values_list('completed','task_key')[0]
+                last_run_instance = TaskInstance.objects.filter(task_key=key).exclude(completed_time=None).order_by('-completed_time').values_list('completed_time','task_key')[0]
                 last_run = last_run_instance[0]
             #no instances
             except (KeyError, IndexError):

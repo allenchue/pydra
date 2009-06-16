@@ -253,7 +253,7 @@ class AMFInterface(pb.Root):
     @authenticated
     def task_history(self, _, key, page):
 
-        instances = TaskInstance.objects.filter(task_key=key).order_by('-completed').order_by('-started')
+        instances = TaskInstance.objects.filter(task_key=key).order_by('-completed_time').order_by('-started')
         paginator = Paginator(instances, 10)
 
          # If page request (9999) is out of range, deliver last page of results.

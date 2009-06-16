@@ -75,12 +75,12 @@ class Scheduler:
         self._listeners = []
 
         if listener:
-            attach_listener(listener)
+            self.attach_listener(listener)
 
-        reactor.callLater(self.update_interval, self.__update_queue)
+        reactor.callLater(self.update_interval, self._update_queue)
 
 
-    def attach_listener(listener):
+    def attach_listener(self, listener):
         if hasattr(listener, 'worker_scheduled') and hasattr(listener,
                 'worker_released'):
             self._listeners.append(listener)
@@ -119,45 +119,31 @@ class Scheduler:
         return task_instance
 
 
-    def remove_task(self, root_task_id, final_status):
+    def cancel_task(self, root_task_id):
         """
-        Removes a task from the scheduling queue.
+        Cancels a task either in the ltq or in the stq.
 
-        Note that removing a task does NOT mean the workers it originally owned
-        are returned. Typically, to fully remove a task from the scheduler, one
-        has to follow two steps, namely:
-        1) Call Scheduler.get_workers_on_task() to get a list of keys of
-        workers working on a specific task.
-        2) Issue those workers to stop their jobs (this step has nothing to do
-            with the scheduler).
-        3) Upon job termination, a worker is returned to the idle pool by
-        calling Scheduler.add_worker()
+        Returns True if the specified task is found in the queue and is
+        successfully removed, and False otherwise.
 
-        Invocation of this method can happen when
-        1) a task fails
-        2) a task is cancelled, etc.
+        BE CAUTIOUS to use this method on a task in the stq because that task
+        may hold unreleased workers. To safely cancel a task in the stq (i.e.,
+        already running), one has to (via the master interface) stop all the
+        workers which are working on the task. Scheduler.add_worker() will
+        handle the rest. So the advice is to only use this method to cancel a
+        running task in case that it does not release workers after being
+        notified to stop.
         """
-        task_instance = self.get_task_instance(root_task_id)
-        if task_instance:
-            if task_instance.status == STATUS_RUNNING:
-                for worker_key in task_instance.workers:
-                    del self._worker_mappings[worker_key]
-                    self.add_worker(worker_key) # no need to pass the owner task
-                for task in self._short_term_queue:
-                    if task[1] == root_task_id:
-                        self._short_term_queue.remove(task)
-                    break
-                heapify(self._short_term_queue)
-            else:
-                for task in self._long_term_queue:
-                    if task[1] == root_task_id:
-                        self._short_long_queue.remove(task)
-                    break
-                heapify(self._long_term_queue)
-
-            task_instance.status = final_status
-            task_instance.save()
-            del self._task_instances[root_task_id]
+        try:
+            with self._queue_lock:
+                self._short_term_queue.remove(root_task_id)
+                task_instance = self._task_instances[root_task_id]
+                task_instance.status = STATUS_CANCELLED
+                task_instance.complete_time = datetime.now()
+                task_instance.save()
+                return True
+        except ValueError:
+            return False
 
 
     def add_worker(self, worker_key, task_status=None):
@@ -178,6 +164,7 @@ class Scheduler:
                 return
             # returns the worker to the idle pool anyway
             self._idle_workers.append(worker_key)
+            logger.info('Worker:%s - added to idle workers' % worker_key)
 
         job = self.get_worker_job(worker_key)
         if job:
@@ -192,16 +179,18 @@ class Scheduler:
                 # this is a primary worker
                 status = STATUS_COMPLETE if task_status is None else task_status
                 task_instance.status = status
+                task_instance.completed_time = datetime.now()
                 task_instance.save()
 
                 with self._queue_lock:
                     if status == STATUS_CANCELLED or status == STATUS_COMPLETE:
                         # safe to remove the task
-                        for task in self._short_term_queue:
-                            if task[1] == job[0]:
-                                self._short_term_queue.remove(task)
-                            break
-                        heapify(self._short_term_queue)
+                        try:
+                            self._short_term_queue.remove(task)
+                            heapify(self._short_term_queue)
+                            logger.info('Task %d: %s is removed from the short-term queue' % (job[0], job[1]))
+                        except ValueError:
+                            pass
                     else:
                         # TODO inspect potential bugs here!
                         # re-queue the worker request
@@ -212,11 +201,19 @@ class Scheduler:
 
     def remove_worker(self, worker_key):
         """
-        Removes a worker.
+        Removes a worker from the idle pool.
+
+        Returns True if this operation succeeds and False otherwise.
         """
         with self._worker_lock:
-            if worker_key in self._idle_workers:
-                self._idle_workers.remove(worker_key)
+            if self.get_worker_job(worker_key) is None:
+                try:
+                    self._idle_workers.remove(worker_key)
+                    logger.info('Worker:%s has been removed from the idle pool')
+                    return True
+                except ValueError:
+                    pass 
+            return False
 
 
     def request_worker(self, root_task_id, args, subtask_key, workunit_key):
@@ -325,5 +322,5 @@ class Scheduler:
                 task[0] = task_instance.compute_score()
             heapify(self._short_term_queue)
 
-            reactor.callLater(self._update_interval, self._update_queue)
+            reactor.callLater(self.update_interval, self._update_queue)
 
