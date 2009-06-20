@@ -453,7 +453,7 @@ class Master(object):
                 if job[3]:
                     logger.warning('%s failed during task, returning work unit' % worker_key)
                     task_instance = self.scheduler.get_task_instance(removed_worker[0])
-                    main_worker = self.workers.get(task_instance.primary_worker,
+                    main_worker = self.workers.get(task_instance.main_worker,
                             None)
                     if main_worker:
                         d = main_worker.remote.callRemote('return_work', job[3],
@@ -548,7 +548,7 @@ class Master(object):
             task_instance = self.scheduler.get_task_instance(task_instance_id)
             if task_instance.status == STATUS_RUNNING:
                 #if this was a subtask the main task needs the results and to be informed
-                main_worker = self.workers[task_instance.primary_worker]
+                main_worker = self.workers[task_instance.main_worker]
                 logger.debug('Worker:%s - informed that subtask completed' %
                         worker_key)
                 main_worker.remote.callRemote('receive_results', results, subtask_key, workunit_key)
@@ -662,8 +662,8 @@ class Master(object):
         #their current task.
         logger.debug('Worker:%s - request for worker: %s:%s' % (workerAvatar.name, subtask_key, args))
 
-        self.scheduler.request_worker(worker_key, root_task_id, args,
-                subtask_key, workunit_key)
+        self.scheduler.request_worker(workerAvatar.name, args, subtask_key,
+                workunit_key)
 
 
     def worker_scheduled(self, worker_key, root_task_id, task_key, args,

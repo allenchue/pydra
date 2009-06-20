@@ -51,6 +51,20 @@ class DummySchedulerListener:
         pass
 
 
+class WorkerJob:
+    """
+    Encapsulates a job that runs on a worker.
+    """
+
+    def __init__(self, root_task_id, task_key, args, subtask_key=None,
+            workunit_key=None):
+        self.root_task_id = root_task_id
+        self.task_key = task_key
+        self.args = args
+        self.subtask_key = subtask_key
+        self.workunit_key = workunit_key
+
+
 class Scheduler:
     """
     The core scheduler class.
@@ -70,6 +84,10 @@ class Scheduler:
         self._task_instances = {} # caching task instances
         self._idle_workers = [] # all workers are seen equal
         self._worker_mappings = {} # worker-job mappings
+
+        # the value is a bool value indicating if this main worker is working
+        # on a workunit
+        self._main_worker_status = {}
 
         self.update_interval = 5 # seconds
         self._listeners = []
@@ -162,40 +180,52 @@ class Scheduler:
                 logger.warn('Worker is already in the idle pool: %s' %
                         worker_key)
                 return
-            # returns the worker to the idle pool anyway
-            self._idle_workers.append(worker_key)
-            logger.info('Worker:%s - added to idle workers' % worker_key)
 
         job = self.get_worker_job(worker_key)
         if job:
-            # this is a worker that was previously working on a job,
-            # so cleanup may be needed.
-            logger.info("Task %d returns a worker: %s" % (job[0], worker_key))
-            task_instance = self._task_instances[job[0]]
-            if job[3]:
-                # this is a worker running a subtask
-                task_instance.workers.remove(worker_key) 
-            else:
-                # this is a primary worker
-                status = STATUS_COMPLETE if task_status is None else task_status
-                task_instance.status = status
-                task_instance.completed_time = datetime.now()
-                task_instance.save()
+            task_instance = self._task_instances[job.root_task_id]
+            main_status = self._main_worker_status.get(worker_key, None)
+            if main_status is not None:
+                # this is a main worker
+                if main_status == True:
+                    # this main worker was working on a workunit
+                    self._main_worker_status[worker_key] = False
+                else:
+                    # reaching here means the whole task has been finished
+                    with self._worker_lock:
+                        del self._main_worker_status[worker_key]
+                    status = STATUS_COMPLETE if task_status is None else task_status
+                    task_instance.status = status
+                    task_instance.completed_time = datetime.now()
+                    task_instance.save()
 
-                with self._queue_lock:
-                    if status == STATUS_CANCELLED or status == STATUS_COMPLETE:
-                        # safe to remove the task
-                        try:
-                            self._short_term_queue.remove(task)
-                            heapify(self._short_term_queue)
-                            logger.info('Task %d: %s is removed from the short-term queue' % (job[0], job[1]))
-                        except ValueError:
-                            pass
-                    else:
-                        # TODO inspect potential bugs here!
-                        # re-queue the worker request
-                        task_instance.queue_worker_request( (job[0], job[1],
-                                        job[2]) )
+                    with self._queue_lock:
+                        if status == STATUS_CANCELLED or status == STATUS_COMPLETE:
+                            # safe to remove the task
+                            try:
+                                self._short_term_queue.remove(task)
+                                heapify(self._short_term_queue)
+                                logger.info('Task %d: %s is removed from the\
+                                        short-term queue' % (job.root_task_id,
+                                            job.task_key))
+                            except ValueError:
+                                pass
+                        else:
+                            # TODO inspect potential bugs here!
+                            # re-queue the worker request
+                            task_instance.queue_worker_request(
+                                    (task_instance.main_worker, job.args,
+                                        job.subtask_key, job.workunit_key) )
+            else:
+                # not a main worker
+                logger.info("Task %d returns a worker: %s" % (job.root_task_id,
+                            worker_key))
+                if job.subtask_key is not None:
+                    # just double-check to make sure
+                    with self._worker_lock:
+                        task_instance.workers.remove(worker_key) 
+                        self._idle_workers.append(worker_key)
+
         self._schedule()
             
 
@@ -216,11 +246,25 @@ class Scheduler:
             return False
 
 
-    def request_worker(self, root_task_id, args, subtask_key, workunit_key):
-        task_instance = self._task_instances.get(root_task_id, None)
-        if task_instance:
-            task_instance.queue_worker_request( (args, subtask_key,
-                            workunit_key) )
+    def request_worker(self, requester_key, args, subtask_key, workunit_key):
+        """
+        Requests a worker for a workunit on behalf of a (main) worker.
+
+        Calling this method means that the worker with key 'requester_key' is a
+        main worker.
+        """
+        job = self.get_worker_job(requester_key)
+        if job:
+            main_status = self._main_worker_status.get(requester_key, None)
+            if main_status is None:
+                # mark this worker as a main worker.
+                # it will be considered by the scheduler as a special worker
+                # resource to complete the task.
+                self._main_worker_status[requester_key] = False
+
+            task_instance = self._task_instances[job.root_task_id]
+            task_instance.queue_worker_request( (requester_key, args,
+                        subtask_key, workunit_key) )
         else:
             # a worker request from an unknown task
             pass
@@ -228,8 +272,7 @@ class Scheduler:
 
     def get_worker_job(self, worker_key):
         """
-        Returns a tuple of (root_task_id, root_task_key, args, subtask_key,
-                workunit_key) or None if the worker is idle.
+        Returns a WorkerJob object or None if the worker is idle.
         If the specified worker is currently a primary one, subtask_key and
         workunit_key should be None.
         """
@@ -245,7 +288,7 @@ class Scheduler:
             return []
         else:
             return [x for x in task_instance.workers] + \
-                task_instance.primary_worker
+                task_instance.main_worker
 
 
     def get_task_instance(self, task_id):
@@ -257,53 +300,62 @@ class Scheduler:
     def _schedule(self):
         """
         Allocates a worker to a task/subtask.
+
+        Note that a main worker is a special worker resource for executing
+        parallel tasks. At the extreme case, a single main worker can finish
+        the whole task even without other workers, albeit probably in a slow
+        way.
         """
-        with self._worker_lock:
-            if self._idle_workers:
-                worker_key = self._idle_workers.pop()
-
-                root_task_id = None
-                with self._queue_lock:
-                    if self._long_term_queue:
-                        root_task_id = heappop(self._long_term_queue)
-                    elif self._short_term_queue:
-                        root_task_id = heappop(self._short_term_queue)
-
-                if root_task_id:
-                    task_instance = self._task_instances[root_task_id]
-                    task_instance.last_succ_time = datetime.now()
-                    task_key = task_instance.task_key
-                    args = task_instance.args
-                    subtask_key, workunit_key = None, None
-                    if task_instance.status == STATUS_STOPPED:
-                        # move the task from the ltq to the stq
-                        with self._queue_lock:
+        worker_key, root_task_id, task_key, args, subtask_key, workunit_key = \
+                        None, None, None, None, None, None
+        with self._queue_lock:
+            # satisfy tasks in the ltq first
+            if self._long_term_queue:
+                with self._worker_lock:
+                    if self._idle_workers:
+                        worker_key = self._idle_workers.pop()
+                        root_task_id = heappop(self._long_term_queue)[1]
+                        task_instance = self._task_instances[root_task_id]
+                        task_instance.last_succ_time = datetime.now()
+                        task_key = task_instance.task_key
+                        args = task_instance.args
+                        subtask_key, workunit_key = None, None
+                        if task_instance.status == STATUS_STOPPED:
+                            # move the task from the ltq to the stq
                             heappush(self._short_term_queue,
                                     [task_instance.compute_score(), root_task_id])
-                        task_instance.primary_worker = worker_key
-                        task_instance.status = STATUS_RUNNING
-                        task_instance.started_time = datetime.now()
-                    elif task_instance.status == STATUS_RUNNING:
-                        # serve a worker request
-                        worker_request = task_instance.pop_worker_request()
-                        args = worker_request[0]
-                        subtask_key = worker_request[1]
-                        workunit_key = worker_request[2]
+                            task_instance.main_worker = worker_key
+                            task_instance.status = STATUS_RUNNING
+                            task_instance.started_time = datetime.now()
+                        task_instance.save()
+            elif self._short_term_queue:
+                with self._worker_lock:
+                    root_task_id = self._short_term_queue[0][1]
+                    task_instance = self._task_instances[root_task_id]
+                    worker_key = None
+                    requester, args, subtask_key, workunit_key = \
+                                                      task_instance.pop_worker_request()
+                    if self._main_worker_status[requester]:
+                        # the main worker can do a local execution
+                        worker_key = requester
+                        self._main_worker_status[requester] = True
+                    elif self._idle_workers:
+                        worker_key = self._idle_workers.pop()
                         task_instance.workers.append(worker_key)
-                    task_instance.save()
 
-                    self._worker_mappings[worker_key] = (root_task_id, task_key,
-                            args, subtask_key, workunit_key)
-             
-                    # notify the observers
-                    for l in self._listeners:
-                        l.worker_scheduled(worker_key, root_task_id, task_key,
-                                args, subtask_key, workunit_key)
 
-                return worker_key, root_task_id
-            else:
-                return None
+        if worker_key:
+            self._worker_mappings[worker_key] = WorkerJob(root_task_id,
+                    task_key, args, subtask_key, workunit_key)
+     
+            # notify the observers
+            for l in self._listeners:
+                l.worker_scheduled(worker_key, root_task_id, task_key,
+                        args, subtask_key, workunit_key)
 
+            return worker_key, root_task_id
+        else:
+            return None
 
 
     def _update_queue(self):

@@ -30,7 +30,7 @@ def init_logging(filename):
     """
 
     # create logger
-    logger = logging.getLogger('root')
+    logger = logging.root
     logger.setLevel(settings.LOG_LEVEL)
 
     handler = logging.handlers.RotatingFileHandler(

@@ -142,7 +142,7 @@ class TaskInstance(models.Model):
     _worker_requests = [] # (args, subtask_key, workunit_key)
 
     # others
-    primary_worker  = None
+    main_worker  = None
     _request_lock = Lock()
 
     objects = TaskInstanceManager()
@@ -170,10 +170,18 @@ class TaskInstance(models.Model):
         return self.priority 
 
     def queue_worker_request(self, request):
+        """
+        A worker request is a tuple of:
+        (requesting_worker_key, args, subtask_key, workunit_key).
+        """
         with self._request_lock:
             self._worker_requests.append(request)
 
     def pop_worker_request(self):
+        """
+        A worker request is a tuple of:
+        (requesting_worker_key, args, subtask_key, workunit_key).
+        """
         with self._request_lock:
             return self._worker_requests.pop(0)
 

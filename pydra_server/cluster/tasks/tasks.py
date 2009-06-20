@@ -514,24 +514,15 @@ class ParallelTask(Task):
         self._available_workers = self.get_worker().available_workers
         logger.debug('Paralleltask - starting, workers available: %i' % self._available_workers)
 
-
-        # if theres more than one worker assign values
-        # this check is required for cases where this is run
-        # on a single core machine.  in that case this worker
-        # is the only worker that exists
-        if self._available_workers > 1:
-            #assign initial set of work to other workers
-            for i in range(1, self._available_workers):
-                logger.debug('Paralleltask - trying to assign worker %i' % i)
-                self._assign_work()
-
-        #start a work_unit locally
-        #reactor.callLater(1, self._assign_work_local)
-        self._assign_work_local()
-
-        logger.debug('Paralleltask - initial work assigned')
-        # loop until all the data is processed
-        reactor.callLater(5, self.more_work)
+        # expand all the work units eagerly. the master will handles these
+        # worker requests. other task implementations (like MapReduceTask) may
+        # employ a more sophisticated mechanism that allows dependence between
+        # work units.
+        data, index = self.get_work_unit()
+        while data is not None:
+            logger.debug('Paralleltask - assigning remote work')
+            self.parent.request_worker(self.subtask.get_key(), {'data':data}, index)
+            data, index = self.get_work_unit()
 
 
     def more_work(self):
