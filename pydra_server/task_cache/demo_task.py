@@ -128,7 +128,7 @@ class TestParallelTask(ParallelTask):
         ParallelTask.__init__(self)
         self.subtask = TestTask('subtask')
         #assign data in init otherwise it could be consumed
-        self._data = range(10)
+        self._data = range(2)
         self._finished = []
 
     def work_unit_complete(self, data, results):

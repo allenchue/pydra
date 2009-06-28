@@ -232,6 +232,7 @@ def load_crypto(path, create=True, key_size=4096):
             if create:
                 #local key does not exist, create and store
                 pub, priv = generate_keys(size=key_size)
+                f = None
                 try:
                     f = file(path,'w')
                     f.write(simplejson.dumps(priv))

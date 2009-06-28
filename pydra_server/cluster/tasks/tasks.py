@@ -446,11 +446,15 @@ class ParallelTask(Task):
     subtask = None              # subtask that is parallelized
     subtask_key = None          # cached key from subtask
 
-    def __init__(self, subtask, msg=None):
+    def __init__(self, msg=None):
         Task.__init__(self, msg)
-        self.subtask = subtask
-        self.subtask = self
         self._lock = Lock()
+
+
+    def __setattr__(self, key, value):
+        Task.__setattr__(self, key, value)
+        if key == 'subtask':
+            value.parent = self
 
 
     def work(self, args, callback, callback_args={}):
@@ -502,7 +506,6 @@ class ParallelTask(Task):
         """
         Work function overridden to delegate workunits to other Workers.
         """
-
         # save data, if any
         if kwargs and kwargs.has_key('data'):
             self._data = kwargs['data']
@@ -523,6 +526,9 @@ class ParallelTask(Task):
             logger.debug('Paralleltask - assigning remote work')
             self.parent.request_worker(self.subtask.get_key(), {'data':data}, index)
             data, index = self.get_work_unit()
+
+        # loop until all the data is processed
+        reactor.callLater(5, self.more_work)
 
 
     def more_work(self):
@@ -594,12 +600,13 @@ class ParallelTask(Task):
         with self._lock:
 
             #grab from the beginning of the list
-            data = self._data.pop(0)
-            self._workunit_count += 1
+            if self._data:
+                data = self._data.pop(0)
+                self._workunit_count += 1
 
-            #remove from _data and add to in_progress
-            self._data_in_progress[self._workunit_count] = data
-        logger.debug('Paralleltask - got a workunit: %s %s' % (data, self._workunit_count))
+                #remove from _data and add to in_progress
+                self._data_in_progress[self._workunit_count] = data
+                logger.debug('Paralleltask - got a workunit: %s %s' % (data, self._workunit_count))
 
         return data, self._workunit_count;
 
@@ -612,19 +619,13 @@ class ParallelTask(Task):
         This method *MUST* lock while it is altering the lists of data
         """
         logger.debug('Paralleltask - REMOTE Work unit completed')
+        logger.info('removing %d, current %s' % (index, self._data_in_progress))
         with self._lock:
             # run the task specific post process
             self.work_unit_complete(self._data_in_progress[index], results)
 
             # remove the workunit from _in_progress
             del self._data_in_progress[index]
-
-        # start another work unit.  its possible there is only 1 unit left and multiple
-        # workers completing at the same time reaching this call.  _assign_work() 
-        # will handle the locking.  It will cause some threads to fail to get work but
-        # that is expected.
-        if len(self._data):
-            self._assign_work()
 
 
     def _local_work_unit_complete(self, results, index):

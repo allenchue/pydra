@@ -26,6 +26,8 @@ from dbsettings.loading import set_setting_value
 
 from threading import Lock
 
+from pydra_server.cluster.tasks.tasks import STATUS_RUNNING, STATUS_STOPPED
+
 
 """ ================================
 Settings
@@ -111,10 +113,10 @@ Custom manager overridden to supply pre-made queryset for queued and running tas
 """
 class TaskInstanceManager(models.Manager):
     def queued(self):
-        return self.filter(completion_type=None, started=None)
+        return self.filter(status=STATUS_STOPPED, started_time=None)
 
     def running(self):
-        return self.filter(completion_type=None).exclude(started=None)
+        return self.filter(status=STATUS_RUNNING).exclude(started_time=None)
 
 
 """
@@ -183,5 +185,19 @@ class TaskInstance(models.Model):
         (requesting_worker_key, args, subtask_key, workunit_key).
         """
         with self._request_lock:
-            return self._worker_requests.pop(0)
+            try:
+                return self._worker_requests.pop(0)
+            except IndexError:
+                return None
+
+    def poll_worker_request(self):
+        """
+        Returns the first worker request in the queue without removing
+        it.
+        """
+        with self._request_lock:
+            try:
+                return self._worker_requests[0]
+            except IndexError:
+                return None
 

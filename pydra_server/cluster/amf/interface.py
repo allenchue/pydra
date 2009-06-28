@@ -142,7 +142,8 @@ class AMFInterface(pb.Root):
         # destroy challenge, each challenge is one use only.
         self.sessions[user]['challenge'] = None
 
-        return self.authenticated
+        return self.sessions[user]['auth']
+
 
 
     @authenticated
@@ -170,10 +171,11 @@ class AMFInterface(pb.Root):
                 for i in range(node.cores):
                     w_key = '%s:%s:%i' % (node.host, node.port, i)
                     html_key = '%s_%i' % (node.id, i)
-                    if w_key in self.master._workers_idle:
+                    w_status = self.master.get_worker_status(w_key)
+                    if w_status == 0:
                         worker_status[html_key] = (1,-1,-1)
-                    elif w_key in self.master._workers_working:
-                        task_instance_id, task_key, args, subtask_key, workunit_key = self.master._workers_working[w_key]
+                    elif w_status == 1:
+                        task_instance_id, task_key, args, subtask_key, workunit_key = self.master.get_worker_job(w_key)
                         worker_status[html_key] = (1,task_key,subtask_key if subtask_key else -1)
                     else:
                         worker_status[html_key] = -1
@@ -201,7 +203,8 @@ class AMFInterface(pb.Root):
         """
         lists tasks in the queue
         """
-        return self.master._queue
+        print 'listing queue!!!'
+        return self.master._queue()
 
 
     @authenticated
@@ -209,7 +212,7 @@ class AMFInterface(pb.Root):
         """
         lists tasks that are running
         """
-        return self.master._running
+        return self.master._running()
 
 
     @authenticated
@@ -246,14 +249,14 @@ class AMFInterface(pb.Root):
         return {
                 'task_key':task_key,
                 'instance_id':task_instance.id,
-                'time':time.mktime(task_instance.queued.timetuple())
+                'time':time.mktime(task_instance.queued_time.timetuple())
                }
 
 
     @authenticated
     def task_history(self, _, key, page):
 
-        instances = TaskInstance.objects.filter(task_key=key).order_by('-completed_time').order_by('-started')
+        instances = TaskInstance.objects.filter(task_key=key).order_by('-completed_time').order_by('-started_time')
         paginator = Paginator(instances, 10)
 
          # If page request (9999) is out of range, deliver last page of results.

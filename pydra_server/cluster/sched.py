@@ -30,6 +30,7 @@ from twisted.internet import reactor
 
 from pydra_server.cluster.tasks.tasks import STATUS_STOPPED, \
          STATUS_RUNNING, STATUS_COMPLETE, STATUS_CANCELLED, STATUS_FAILED
+from pydra_server.models import TaskInstance
 
 logger = logging.getLogger('pydra_server.cluster.sched')
 
@@ -39,15 +40,6 @@ logger = logging.getLogger('pydra_server.cluster.sched')
 class DummySchedulerListener:
 
     def worker_scheduled(self, worker_key):
-        pass
-
-    def worker_removed(self, worker_key):
-        pass
-
-    def worker_added(self, worker_key):
-        pass
-
-    def task_removed(self, root_task_id):
         pass
 
 
@@ -81,7 +73,7 @@ class Scheduler:
 
         self._long_term_queue = []
         self._short_term_queue = []
-        self._task_instances = {} # caching task instances
+        self._active_tasks = {} # caching uncompleted task instances
         self._idle_workers = [] # all workers are seen equal
         self._worker_mappings = {} # worker-job mappings
 
@@ -95,12 +87,13 @@ class Scheduler:
         if listener:
             self.attach_listener(listener)
 
+        self._init_queue()
+
         reactor.callLater(self.update_interval, self._update_queue)
 
 
     def attach_listener(self, listener):
-        if hasattr(listener, 'worker_scheduled') and hasattr(listener,
-                'worker_released'):
+        if hasattr(listener, 'worker_scheduled'):
             self._listeners.append(listener)
         else:
             logger.warn('Ignored to attach an invalid listener')           
@@ -113,7 +106,7 @@ class Scheduler:
         Under the hood, the scheduler creates a task instance for the task, puts
         it into the long-term queue, and then tries to advance the queue.
         """
-        logger.info('Task:%s:%s - Queued:  %s' % (task_key, subtask_key, args))
+        logger.info('Task:%s - Queued:  %s' % (task_key, args))
 
         task_instance = TaskInstance()
         task_instance.task_key = task_key
@@ -130,7 +123,7 @@ class Scheduler:
             heappush(self._long_term_queue, [task_instance.compute_score(), task_id])
 
         # cache this task
-        self._task_instances[task_id] = task_instance
+        self._active_tasks[task_id] = task_instance
 
         self._schedule()
 
@@ -144,6 +137,7 @@ class Scheduler:
         Returns True if the specified task is found in the queue and is
         successfully removed, and False otherwise.
 
+        This method does NOT release the workers held by the cancelled task. So
         BE CAUTIOUS to use this method on a task in the stq because that task
         may hold unreleased workers. To safely cancel a task in the stq (i.e.,
         already running), one has to (via the master interface) stop all the
@@ -154,11 +148,28 @@ class Scheduler:
         """
         try:
             with self._queue_lock:
-                self._short_term_queue.remove(root_task_id)
-                task_instance = self._task_instances[root_task_id]
-                task_instance.status = STATUS_CANCELLED
-                task_instance.complete_time = datetime.now()
-                task_instance.save()
+                found = False
+                # find the task in the ltq
+                length = len(self._long_term_queue)
+                for i in range(0, length):
+                    if self._long_term_queue[i][1] == root_task_id:
+                        del self._long_term_queue[i]
+                        found = True
+                        break
+                else:
+                    length = len(self._long_term_queue)
+                    for i in range(0, length):
+                        if self._long_term_queue[i][1] == root_task_id:
+                            del self._long_term_queue[i]
+                            found = True
+                            # XXX release the workers held by this task?
+                            break
+
+                if found:
+                    task_instance = self._active_tasks.pop(root_task_id)
+                    task_instance.status = STATUS_CANCELLED
+                    task_instance.completed_time = datetime.now()
+                    task_instance.save()
                 return True
         except ValueError:
             return False
@@ -176,23 +187,27 @@ class Scheduler:
         that worker.
         """
         with self._worker_lock:
-            if worker_key in self._workers_idle:
+            if worker_key in self._idle_workers:
                 logger.warn('Worker is already in the idle pool: %s' %
                         worker_key)
                 return
 
         job = self.get_worker_job(worker_key)
         if job:
-            task_instance = self._task_instances[job.root_task_id]
+            task_instance = self._active_tasks[job.root_task_id]
             main_status = self._main_worker_status.get(worker_key, None)
             if main_status is not None:
                 # this is a main worker
                 if main_status == True:
                     # this main worker was working on a workunit
+                    logger.info('Main worker:%s ready for work again' % worker_key)
                     self._main_worker_status[worker_key] = False
                 else:
                     # reaching here means the whole task has been finished
+                    logger.info('Last worker held by task %s is returned' \
+                            % task_instance.task_key)
                     with self._worker_lock:
+                        self._idle_workers.append(worker_key)
                         del self._main_worker_status[worker_key]
                     status = STATUS_COMPLETE if task_status is None else task_status
                     task_instance.status = status
@@ -202,14 +217,14 @@ class Scheduler:
                     with self._queue_lock:
                         if status == STATUS_CANCELLED or status == STATUS_COMPLETE:
                             # safe to remove the task
-                            try:
-                                self._short_term_queue.remove(task)
-                                heapify(self._short_term_queue)
-                                logger.info('Task %d: %s is removed from the\
-                                        short-term queue' % (job.root_task_id,
-                                            job.task_key))
-                            except ValueError:
-                                pass
+                            length = len(self._short_term_queue)
+                            for i in range(0, length):
+                                if self._short_term_queue[i][1] == job.root_task_id:
+                                    del self._short_term_queue[i]
+                                    logger.info(
+                                            'Task %d: %s is removed from the short-term queue' % \
+                                            (job.root_task_id, job.task_key))
+                            heapify(self._short_term_queue)
                         else:
                             # TODO inspect potential bugs here!
                             # re-queue the worker request
@@ -225,9 +240,14 @@ class Scheduler:
                     with self._worker_lock:
                         task_instance.workers.remove(worker_key) 
                         self._idle_workers.append(worker_key)
+        else:
+            # a new worker
+            logger.info('A new worker:%s is added' % worker_key)
+            with self._worker_lock:
+                self._idle_workers.append(worker_key)
 
         self._schedule()
-            
+ 
 
     def remove_worker(self, worker_key):
         """
@@ -243,6 +263,9 @@ class Scheduler:
                     return True
                 except ValueError:
                     pass 
+            else:
+                logger.warn('Removal of worker:%s failed: worker busy',
+                        worker_key)
             return False
 
 
@@ -262,9 +285,11 @@ class Scheduler:
                 # resource to complete the task.
                 self._main_worker_status[requester_key] = False
 
-            task_instance = self._task_instances[job.root_task_id]
+            task_instance = self._active_tasks[job.root_task_id]
             task_instance.queue_worker_request( (requester_key, args,
                         subtask_key, workunit_key) )
+
+            self._schedule()
         else:
             # a worker request from an unknown task
             pass
@@ -283,8 +308,9 @@ class Scheduler:
         """
         Returns a list of keys of those workers working on a specified task.
         """
-        task_instance = self._task_instances.get(root_task_id, None)
+        task_instance = self._active_tasks.get(root_task_id, None)
         if task_instance is None:
+            # finished task or non-existent task
             return []
         else:
             return [x for x in task_instance.workers] + \
@@ -292,9 +318,28 @@ class Scheduler:
 
 
     def get_task_instance(self, task_id):
-        task_instance = self._task_instances.get(task_id, None)
+        task_instance = self._active_tasks.get(task_id, None)
         return TaskInstance.objects.get(id=task_id) if task_instance \
                                            is None else task_instance
+
+
+    def get_queued_tasks(self):
+        return [self._active_tasks[x[1]] for x in self._long_term_queue]
+
+
+    def get_running_tasks(self):
+        return [self._active_tasks[x[1]] for x in self._short_term_queue]
+
+
+    def get_worker_status(self, worker_key):
+        """
+        0: idle; 1: working; -1: unknown
+        """
+        if worker_key in self._idle_workers:
+            return 0
+        if self.get_worker_job(worker_key):
+            return 1
+        return -1
 
 
     def _schedule(self):
@@ -313,36 +358,51 @@ class Scheduler:
             if self._long_term_queue:
                 with self._worker_lock:
                     if self._idle_workers:
+                        # move the task from the ltq to the stq
                         worker_key = self._idle_workers.pop()
                         root_task_id = heappop(self._long_term_queue)[1]
-                        task_instance = self._task_instances[root_task_id]
+                        task_instance = self._active_tasks[root_task_id]
                         task_instance.last_succ_time = datetime.now()
                         task_key = task_instance.task_key
-                        args = task_instance.args
+                        args = simplejson.loads(task_instance.args)
                         subtask_key, workunit_key = None, None
-                        if task_instance.status == STATUS_STOPPED:
-                            # move the task from the ltq to the stq
-                            heappush(self._short_term_queue,
-                                    [task_instance.compute_score(), root_task_id])
-                            task_instance.main_worker = worker_key
-                            task_instance.status = STATUS_RUNNING
-                            task_instance.started_time = datetime.now()
+                        heappush(self._short_term_queue,
+                                [task_instance.compute_score(), root_task_id])
+                        task_instance.main_worker = worker_key
+                        task_instance.status = STATUS_RUNNING
+                        task_instance.started_time = datetime.now()
                         task_instance.save()
+
+                        self._main_worker_status[worker_key] = False
+                        logger.info('Task %d has been moved from ltq to stq' %
+                                root_task_id)
             elif self._short_term_queue:
                 with self._worker_lock:
-                    root_task_id = self._short_term_queue[0][1]
-                    task_instance = self._task_instances[root_task_id]
-                    worker_key = None
-                    requester, args, subtask_key, workunit_key = \
-                                                      task_instance.pop_worker_request()
-                    if self._main_worker_status[requester]:
+                    task_instance, worker_request = None, None
+                    for task in self._short_term_queue:
+                        root_task_id = task[1]
+                        task_instance = self._active_tasks[root_task_id]
+                        worker_request = task_instance.poll_worker_request()
+                        if worker_request:
+                            break
+                    else:
+                        # no pending worker requests
+                        return
+                    requester, args, subtask_key, workunit_key = worker_request
+                    task_key = task_instance.task_key
+                    if not self._main_worker_status[requester]:
                         # the main worker can do a local execution
+                        task_instance.pop_worker_request()
+                        logger.info('Main worker:%s assigned to task %s' %
+                                (requester, task_instance.task_key))
                         worker_key = requester
                         self._main_worker_status[requester] = True
                     elif self._idle_workers:
+                        task_instance.pop_worker_request()
                         worker_key = self._idle_workers.pop()
                         task_instance.workers.append(worker_key)
-
+                        logger.info('Worker:%s assigned to task %s' %
+                                (requester, task_instance.task_key))
 
         if worker_key:
             self._worker_mappings[worker_key] = WorkerJob(root_task_id,
@@ -358,6 +418,21 @@ class Scheduler:
             return None
 
 
+    def _init_queue(self):
+        """
+        Initialize the ltq and the stq by reading the persistent store.
+        """
+        with self._queue_lock:
+            queued = TaskInstance.objects.queued()
+            running = TaskInstance.objects.running()
+            for t in queued:
+                self._long_term_queue.append([t.compute_score(), t.id])
+                self._active_tasks[t.id] = t
+            for t in running:
+                self._short_term_queue.append([t.compute_score(), t.id])
+                self._active_tasks[t.id] = t
+
+
     def _update_queue(self):
         """
         Periodically updates the scores of entries in both the long-term and the
@@ -365,12 +440,12 @@ class Scheduler:
         """
         with self._queue_lock:
             for task in self._long_term_queue:
-                task_instance = self._task_instances[task[1]]
+                task_instance = self._active_tasks[task[1]]
                 task[0] = task_instance.compute_score()
             heapify(self._long_term_queue)
 
             for task_id in self._long_term_queue:
-                task_instance = self._task_instances[task[1]]
+                task_instance = self._active_tasks[task[1]]
                 task[0] = task_instance.compute_score()
             heapify(self._short_term_queue)
 

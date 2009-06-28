@@ -450,14 +450,13 @@ class Master(object):
             #worker was working on a task, need to clean it up
             else:
                 #worker was working on a subtask, return unfinished work to main worker
-                if job[3]:
+                if job.subtask_key:
                     logger.warning('%s failed during task, returning work unit' % worker_key)
-                    task_instance = self.scheduler.get_task_instance(removed_worker[0])
-                    main_worker = self.workers.get(task_instance.main_worker,
-                            None)
+                    task_instance = self.scheduler.get_task_instance(job.root_task_id)
+                    main_worker = self.workers.get(task_instance.main_worker, None)
                     if main_worker:
-                        d = main_worker.remote.callRemote('return_work', job[3],
-                                job[4])
+                        d = main_worker.remote.callRemote('return_work',
+                                job.subtask_key, job.workunit_key)
                         d.addCallback(self.return_work_success, worker_key)
                         d.addErrback(self.return_work_failed, worker_key)
 
@@ -520,7 +519,7 @@ class Master(object):
         return 1
 
 
-    def run_task_failed(self, worker_key):
+    def run_task_failed(self, results, worker_key):
         # return the worker to the pool
         self.scheduler.add_worker(worker_key)
 
@@ -533,8 +532,9 @@ class Master(object):
         """
         logger.debug('Worker:%s - sent results: %s' % (worker_key, results))
         with self._lock:
-            task_instance_id, task_key, args, subtask_key, workunit_key = self.scheduler.get_worker_job(worker_key)
-            logger.info('Worker:%s - completed: %s:%s (%s)' % (worker_key, task_key, subtask_key, workunit_key))
+            job = self.scheduler.get_worker_job(worker_key)
+            logger.info('Worker:%s - completed: %s:%s (%s)' %  \
+                    (worker_key, job.task_key, job.subtask_key, job.workunit_key))
 
             # release the worker back into the idle pool
             # this must be done before informing the 
@@ -545,13 +545,14 @@ class Master(object):
             #check to make sure the task was still in the queue.  Its possible this call was made at the same
             # time a task was being canceled.  Only worry about sending the reults back to the Task Head
             # if the task is still running
-            task_instance = self.scheduler.get_task_instance(task_instance_id)
-            if task_instance.status == STATUS_RUNNING:
+            if job.subtask_key:
                 #if this was a subtask the main task needs the results and to be informed
+                task_instance = self.scheduler.get_task_instance(job.root_task_id);
                 main_worker = self.workers[task_instance.main_worker]
                 logger.debug('Worker:%s - informed that subtask completed' %
                         worker_key)
-                main_worker.remote.callRemote('receive_results', results, subtask_key, workunit_key)
+                main_worker.remote.callRemote('receive_results', results, 
+                        job.subtask_key, job.workunit_key)
 
 
     def task_failed(self, worker_key, results, workunit_key):
@@ -561,14 +562,15 @@ class Master(object):
         with self._lock:
             job = self.scheduler.get_worker_job(worker_key)
             if job is not None:
-                logger.info('Worker:%s - failed: %s:%s (%s)' % (worker_key,
-                        job[1], job[3], job[4]))
+                logger.info('Worker:%s - failed: %s:%s (%s)\n%s' % (worker_key,
+                        job.task_key, job.subtask_key, job.workunit_key, results))
             self.scheduler.add_worker(worker_key, STATUS_FAILED)
 
             # cancel the task and send notice to all other workers to stop
             # working on this task.  This may be partially recoverable but that
             # is not included for now.
-            for worker_key in self.scheduler.get_workers_on_task(job[0]):
+            for worker_key in self.scheduler.get_workers_on_task(
+                    job.root_task_id):
                 worker = self.workers[worker_key]
                 logger.debug('signalling worker to stop: %s' % worker_key)
                 worker.remote.callRemote('stop_task')
@@ -588,12 +590,12 @@ class Master(object):
         # limit updates so multiple controllers won't cause excessive updates
         now = datetime.datetime.now()
         if self._next_task_status_update < now:
-            workers = self.workers
-            for key, data in self._workers_working.items():
-                worker = workers[key]
-                task_instance_id = data[0]
-                deferred = worker.remote.callRemote('task_status')
-                deferred.addCallback(self.fetch_task_status_success, task_instance_id)
+            for key, worker in self.workers.items():
+                if self.get_worker_status(key) == 1:
+                    data = self.scheduler.get_worker_job(key)
+                    task_instance_id = data.root_task_id
+                    deferred = worker.remote.callRemote('task_status')
+                    deferred.addCallback(self.fetch_task_status_success, task_instance_id)
             self.next_task_status_update = now + datetime.timedelta(0, 3)
 
 
@@ -616,11 +618,11 @@ class Master(object):
         self.fetch_task_status()
 
         statuses = {}
-        for instance in self._queue:
+        for instance in self._queue():
             statuses[instance.id] = {'s':STATUS_STOPPED}
 
-        for instance in self._running:
-            start = time.mktime(instance.started.timetuple())
+        for instance in self._running():
+            start = time.mktime(instance.started_time.timetuple())
 
             # call worker to get status update
             try:
@@ -669,8 +671,21 @@ class Master(object):
     def worker_scheduled(self, worker_key, root_task_id, task_key, args,
             subtask_key=None, workunit_key=None):
         worker = self.workers[worker_key]
-        d = worker.remote.callRemote('run_task', task_key, args, subtask_key, workunit_key, available_workers)
-        d.addErrCallback(self.run_task_failed, worker, task_instance_id, subtask_key)
+        d = worker.remote.callRemote('run_task', task_key, args,
+                subtask_key, workunit_key, 0)
+        d.addErrback(self.run_task_failed, worker_key)
+
+
+    def get_worker_status(self, worker_key):
+        return self.scheduler.get_worker_status(worker_key)
+
+
+    def _queue(self):
+        return self.scheduler.get_queued_tasks()
+
+
+    def _running(self):
+        return self.scheduler.get_running_tasks()
 
 
 class MasterRealm:

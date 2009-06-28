@@ -42,6 +42,7 @@ from twisted.cred import credentials
 from twisted.internet.protocol import ReconnectingClientFactory
 from threading import Lock
 
+from pydra_server.cluster.tasks.tasks import ParallelTask
 from pydra_server.cluster.auth.rsa_auth import RSAClient, load_crypto
 from pydra_server.cluster.tasks.task_manager import TaskManager
 from constants import *
@@ -84,6 +85,9 @@ class Worker(pb.Referenceable):
     def __init__(self, master_host, master_port, node_key, worker_key):
         self.id = id
         self.__task = None
+        self.__subtask = None
+        self.__workunit_key = None
+        self.__local_workunit_key = None
         self.__task_instance = None
         self.__results = None
         self.__stop_flag = None
@@ -157,31 +161,56 @@ class Worker(pb.Referenceable):
         """
         Runs a task on this worker
         """
-
+        logger.info('Calling run_task with key=%s, sub=%s, w=%s, arg=%s' % (key,
+                    subtask_key, workunit_key, args))
         #Check to ensure this worker is not already busy.
         # The Master should catch this but lets be defensive.
+        run_local = False
         with self.__lock:
-            if self.__task:
+            if not key:
+                return "FAILURE: NO TASK KEY SPECIFIED"
+            if self.__task and (not isinstance(self.__task_instance,
+                        ParallelTask) or self.__local_workunit_key or \
+                    self.__task <> key):
+                # an ugly hack:
+                # we explicitly test if the loaded task is a parallel task.
+                # And if it is, we allow this worker to run an additional
+                # subtask.
+                logger.warn('This worker is already running a task')
                 return "FAILURE THIS WORKER IS ALREADY RUNNING A TASK"
+
             self.__task = key
             self.__subtask = subtask_key
-            self.__workunit_key = workunit_key
+            if self.__task == key and subtask_key and workunit_key:
+                # the master wants this worker to exec a workunit locally
+                logger.info('The master wants to exec a local work')
+                self.__local_workunit_key = workunit_key
+                run_local = True
+            else:
+                self.__workunit_key = workunit_key
 
         self.available_workers = available_workers
 
-        logger.info('Worker:%s - starting task: %s:%s  %s' % (self.worker_key, key,subtask_key, args))
-        #create an instance of the requested task
-        self.__task_instance = object.__new__(self.available_tasks[key])
-        self.__task_instance.__init__()
-        self.__task_instance.parent = self
+        logger.debug('Worker:%s - starting task: %s:%s  %s' % (self.worker_key, key,subtask_key, args))
 
         # process args to make sure they are no longer unicode
         clean_args = {}
         if args:
-            for key, arg in args.items():
-                clean_args[key.__str__()] = arg
-
-        return self.__task_instance.start(clean_args, subtask_key, self.work_complete, errback=self.work_failed)
+            for arg_key, arg_value in args.items():
+                clean_args[arg_key.__str__()] = arg_value
+        if run_local:
+            task_instance = object.__new__(self.available_tasks[key])
+            task_instance.__init__()
+            task_instance.parent = self
+            return task_instance.start(clean_args, subtask_key,
+                    self._local_work_completed, errback=self._local_work_failed)
+        else:
+            #create an instance of the requested task
+            self.__task_instance = object.__new__(self.available_tasks[key])
+            self.__task_instance.__init__()
+            self.__task_instance.parent = self
+            return self.__task_instance.start(clean_args, subtask_key, self.work_complete,
+                    errback=self.work_failed)
 
 
     def stop_task(self):
@@ -310,6 +339,7 @@ class Worker(pb.Referenceable):
         """
         Function called to make the subtask receive the results processed by another worker
         """
+        logger.info("%s" % self.__task_instance)
         subtask = self.__task_instance.get_subtask(subtask_key.split('.'))
         subtask.parent._work_unit_complete(results, workunit_key)
 
@@ -357,6 +387,30 @@ class Worker(pb.Referenceable):
 
     def remote_task_status(self):
         return self.task_status()
+
+
+    def _local_work_completed(self, results):
+        """
+        Callback that is called when a local work unit is finished.
+        Failure is not handled right now.
+        """
+        with self.__lock_connection:
+            self.__local_workunit_key = None
+            if self.master:
+                deferred = self.master.callRemote("send_results", results,
+                        self.__local_workunit_key)
+                deferred.addErrback(self.send_results_failed, results,
+                        self.__local_workunit_key)
+
+
+    def _local_work_failed(self, results):
+        """
+        Callback that there was an exception thrown by the task
+        """
+        with self.__lock_connection:
+            if self.master:
+                deferred = self.master.callRemote("failed", results,
+                        self.__local_workunit_key)
 
 
 if __name__ == "__main__":
