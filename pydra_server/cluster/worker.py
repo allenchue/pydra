@@ -342,6 +342,7 @@ class Worker(pb.Referenceable):
         logger.info("%s" % self.__task_instance)
         subtask = self.__task_instance.get_subtask(subtask_key.split('.'))
         subtask.parent._work_unit_complete(results, workunit_key)
+        # FIXME should return whether this task still needs this worker
 
 
     def request_worker(self, subtask_key, args, workunit_key):
