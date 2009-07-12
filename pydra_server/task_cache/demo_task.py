@@ -134,6 +134,10 @@ class TestParallelTask(ParallelTask):
     def work_unit_complete(self, data, results):
         logger.info('   Adding results:%s' % results)
         self._finished.append(results)
+        if data == 3:
+            # release the worker
+            return True
+        # the default returning value is None, which means to retain the worker
 
     def work_complete(self):
         logger.info('tabulating results!')

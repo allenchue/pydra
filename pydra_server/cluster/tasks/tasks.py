@@ -622,10 +622,12 @@ class ParallelTask(Task):
         logger.info('removing %d, current %s' % (index, self._data_in_progress))
         with self._lock:
             # run the task specific post process
-            self.work_unit_complete(self._data_in_progress[index], results)
+            release_worker = self.work_unit_complete(
+                    self._data_in_progress[index], results)
 
             # remove the workunit from _in_progress
             del self._data_in_progress[index]
+            return release_worker
 
 
     def _local_work_unit_complete(self, results, index):

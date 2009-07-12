@@ -203,7 +203,6 @@ class AMFInterface(pb.Root):
         """
         lists tasks in the queue
         """
-        print 'listing queue!!!'
         return self.master._queue()
 
 

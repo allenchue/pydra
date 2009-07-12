@@ -139,7 +139,8 @@ class TaskInstance(models.Model):
 
     # scheduling-related
     priority        = 5
-    workers         = [] # workers allocated (keys only, excluding the main worker)
+    running_workers         = [] # running workers (keys only, excluding the main worker)
+    waiting_workers         = [] # workers waiting for more workunits
     last_succ_time  = None # when this task last time gets a worker
     _worker_requests = [] # (args, subtask_key, workunit_key)
 

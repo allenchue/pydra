@@ -82,3 +82,10 @@ class WorkerAvatar(RSAAvatar):
         returns the status (progress) of the task this worker is working on
         """
         return self.server.task_status(self)
+
+
+    def perspective_release_worker(self, worker_key):
+        """
+        Called when a main worker wants to release a worker.
+        """
+        return self.server.release_worker(worker_key)

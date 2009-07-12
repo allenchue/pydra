@@ -241,6 +241,8 @@ class Worker(pb.Referenceable):
         """
         Callback that is called when a job is run in non_blocking mode.
         """
+        if not self.__workunit_key:
+            logger.info('no workunit key!')
         stop_flag = self.__task_instance.STOP_FLAG
         self.__task = None
 
@@ -335,14 +337,17 @@ class Worker(pb.Referenceable):
             return self.__task_instance.progress()
 
 
-    def receive_results(self, results, subtask_key, workunit_key):
+    def receive_results(self, worker_key, results, subtask_key,
+            workunit_key):
         """
         Function called to make the subtask receive the results processed by another worker
         """
         logger.info("%s" % self.__task_instance)
         subtask = self.__task_instance.get_subtask(subtask_key.split('.'))
-        subtask.parent._work_unit_complete(results, workunit_key)
-        # FIXME should return whether this task still needs this worker
+        release_worker = subtask.parent._work_unit_complete(results, workunit_key)
+        if release_worker:
+            # notify the master to let it release the worker
+            self.master.callRemote('release_worker', worker_key)
 
 
     def request_worker(self, subtask_key, args, workunit_key):
@@ -376,8 +381,8 @@ class Worker(pb.Referenceable):
     def remote_stop_task(self):
         return self.stop_task()
 
-    def remote_receive_results(self, results, subtask_key, workunit_key):
-        return self.receive_results(results, subtask_key, workunit_key)
+    def remote_receive_results(self, worker_key, results, subtask_key, workunit_key):
+        return self.receive_results(worker_key, results, subtask_key, workunit_key)
 
     def remote_return_work(self, subtask_key, workunit_key):
         """

@@ -540,7 +540,14 @@ class Master(object):
             # this must be done before informing the 
             # main worker.  otherwise a new work request
             # can be made before the worker is released
-            self.scheduler.add_worker(worker_key)
+            
+            # If the source worker is not the main worker, then hold this
+            # worker until the master receives an explicit release message
+            # from the main worker
+            if job.subtask_key:
+                self.scheduler.hold_worker(worker_key)
+            else:
+                self.scheduler.add_worker(worker_key)
 
             #check to make sure the task was still in the queue.  Its possible this call was made at the same
             # time a task was being canceled.  Only worry about sending the reults back to the Task Head
@@ -551,8 +558,8 @@ class Master(object):
                 main_worker = self.workers[task_instance.main_worker]
                 logger.debug('Worker:%s - informed that subtask completed' %
                         worker_key)
-                main_worker.remote.callRemote('receive_results', results, 
-                        job.subtask_key, job.workunit_key)
+                main_worker.remote.callRemote('receive_results', worker_key,
+                        results, job.subtask_key, job.workunit_key)
 
 
     def task_failed(self, worker_key, results, workunit_key):
@@ -666,6 +673,10 @@ class Master(object):
 
         self.scheduler.request_worker(workerAvatar.name, args, subtask_key,
                 workunit_key)
+
+
+    def release_worker(self, worker_key):
+        self.scheduler.add_worker(worker_key)
 
 
     def worker_scheduled(self, worker_key, root_task_id, task_key, args,

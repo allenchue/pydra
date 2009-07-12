@@ -76,6 +76,7 @@ class Scheduler:
         self._active_tasks = {} # caching uncompleted task instances
         self._idle_workers = [] # all workers are seen equal
         self._worker_mappings = {} # worker-job mappings
+        self._waiting_workers = {} # task-worker mappings
 
         # the value is a bool value indicating if this main worker is working
         # on a workunit
@@ -209,6 +210,7 @@ class Scheduler:
                     with self._worker_lock:
                         self._idle_workers.append(worker_key)
                         del self._main_worker_status[worker_key]
+                        del self._worker_mappings[worker_key]
                     status = STATUS_COMPLETE if task_status is None else task_status
                     task_instance.status = status
                     task_instance.completed_time = datetime.now()
@@ -238,7 +240,8 @@ class Scheduler:
                 if job.subtask_key is not None:
                     # just double-check to make sure
                     with self._worker_lock:
-                        task_instance.workers.remove(worker_key) 
+                        del self._worker_mappings[worker_key]
+                        task_instance.running_workers.remove(worker_key) 
                         self._idle_workers.append(worker_key)
         else:
             # a new worker
@@ -267,6 +270,17 @@ class Scheduler:
                 logger.warn('Removal of worker:%s failed: worker busy',
                         worker_key)
             return False
+
+
+    def hold_worker(self, worker_key):
+        with self._worker_lock:
+            job = self._worker_mappings.get(worker_key, None)
+            if job:
+                task_instance = self._active_tasks.get(job.root_task_id, None)
+                if task_instance and worker_key <> task_instance.main_worker:
+                    task_instance.running_workers.remove(worker_key)
+                    task_instance.waiting_workers.append(worker_key)
+                    del self._worker_mappings[worker_key]
 
 
     def request_worker(self, requester_key, args, subtask_key, workunit_key):
@@ -313,7 +327,8 @@ class Scheduler:
             # finished task or non-existent task
             return []
         else:
-            return [x for x in task_instance.workers] + \
+            return [x for x in task_instance.running_workers] + \
+                [x for x in task_instance.waiting_workers] + \
                 task_instance.main_worker
 
 
@@ -333,12 +348,15 @@ class Scheduler:
 
     def get_worker_status(self, worker_key):
         """
-        0: idle; 1: working; -1: unknown
+        0: idle; 1: working; 2: waiting; -1: unknown
         """
-        if worker_key in self._idle_workers:
-            return 0
-        if self.get_worker_job(worker_key):
+        job = self.get_worker_job(worker_key)
+        if job:
             return 1
+        elif self._waiting_workers.get(worker_key, None):
+            return 2
+        elif worker_key in self._idle_workers:
+            return 0
         return -1
 
 
@@ -390,7 +408,12 @@ class Scheduler:
                         return
                     requester, args, subtask_key, workunit_key = worker_request
                     task_key = task_instance.task_key
-                    if not self._main_worker_status[requester]:
+                    if task_instance.waiting_workers:
+                        logger.info('Re-dispatching waiting worker:%s to' % 
+                                worker_key)
+                        worker_key = task_instance.waiting_workers.pop()
+                        task_instance.running_workers.append(worker_key)
+                    elif not self._main_worker_status[requester]:
                         # the main worker can do a local execution
                         task_instance.pop_worker_request()
                         logger.info('Main worker:%s assigned to task %s' %
@@ -400,7 +423,7 @@ class Scheduler:
                     elif self._idle_workers:
                         task_instance.pop_worker_request()
                         worker_key = self._idle_workers.pop()
-                        task_instance.workers.append(worker_key)
+                        task_instance.running_workers.append(worker_key)
                         logger.info('Worker:%s assigned to task %s' %
                                 (requester, task_instance.task_key))
 
