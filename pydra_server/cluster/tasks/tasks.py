@@ -619,7 +619,6 @@ class ParallelTask(Task):
         This method *MUST* lock while it is altering the lists of data
         """
         logger.debug('Paralleltask - REMOTE Work unit completed')
-        logger.info('removing %d, current %s' % (index, self._data_in_progress))
         with self._lock:
             # run the task specific post process
             release_worker = self.work_unit_complete(

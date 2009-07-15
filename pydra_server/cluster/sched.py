@@ -37,24 +37,19 @@ logger = logging.getLogger('pydra_server.cluster.sched')
 # TODO make this module work well with Twisted
 
 
-class DummySchedulerListener:
-
-    def worker_scheduled(self, worker_key):
-        pass
-
-
 class WorkerJob:
     """
     Encapsulates a job that runs on a worker.
     """
 
     def __init__(self, root_task_id, task_key, args, subtask_key=None,
-            workunit_key=None):
+            workunit_key=None, on_main_worker=False):
         self.root_task_id = root_task_id
         self.task_key = task_key
         self.args = args
         self.subtask_key = subtask_key
         self.workunit_key = workunit_key
+        self.on_main_worker = on_main_worker
 
 
 class Scheduler:
@@ -178,7 +173,7 @@ class Scheduler:
 
     def add_worker(self, worker_key, task_status=None):
         """
-        Adds a worker to the idle pool.
+        Adds a worker to the **idle pool**.
 
         Two possible invocation situations: 1) a new worker joins; and 2) a
         worker previously working on a work unit is returned to the pool.
@@ -215,6 +210,8 @@ class Scheduler:
                     task_instance.status = status
                     task_instance.completed_time = datetime.now()
                     task_instance.save()
+
+                    # TODO release all the waiting workers
 
                     with self._queue_lock:
                         if status == STATUS_CANCELLED or status == STATUS_COMPLETE:
@@ -262,7 +259,8 @@ class Scheduler:
             if self.get_worker_job(worker_key) is None:
                 try:
                     self._idle_workers.remove(worker_key)
-                    logger.info('Worker:%s has been removed from the idle pool')
+                    logger.info('Worker:%s has been removed from the idle pool'
+                            % worker_key)
                     return True
                 except ValueError:
                     pass 
@@ -274,13 +272,15 @@ class Scheduler:
 
     def hold_worker(self, worker_key):
         with self._worker_lock:
-            job = self._worker_mappings.get(worker_key, None)
-            if job:
-                task_instance = self._active_tasks.get(job.root_task_id, None)
-                if task_instance and worker_key <> task_instance.main_worker:
-                    task_instance.running_workers.remove(worker_key)
-                    task_instance.waiting_workers.append(worker_key)
-                    del self._worker_mappings[worker_key]
+            if not self._main_worker_status.get(worker_key, None):
+                # we don't need to retain a main worker
+                job = self._worker_mappings.get(worker_key, None)
+                if job:
+                    task_instance = self._active_tasks.get(job.root_task_id, None)
+                    if task_instance and worker_key <> task_instance.main_worker:
+                        task_instance.running_workers.remove(worker_key)
+                        task_instance.waiting_workers.append(worker_key)
+                        del self._worker_mappings[worker_key]
 
 
     def request_worker(self, requester_key, args, subtask_key, workunit_key):
@@ -300,6 +300,7 @@ class Scheduler:
                 self._main_worker_status[requester_key] = False
 
             task_instance = self._active_tasks[job.root_task_id]
+            logger.info('queuing one worker request')
             task_instance.queue_worker_request( (requester_key, args,
                         subtask_key, workunit_key) )
 
@@ -312,8 +313,6 @@ class Scheduler:
     def get_worker_job(self, worker_key):
         """
         Returns a WorkerJob object or None if the worker is idle.
-        If the specified worker is currently a primary one, subtask_key and
-        workunit_key should be None.
         """
         return self._worker_mappings.get(worker_key, None)
 
@@ -371,6 +370,7 @@ class Scheduler:
         """
         worker_key, root_task_id, task_key, args, subtask_key, workunit_key = \
                         None, None, None, None, None, None
+        on_main_worker = False
         with self._queue_lock:
             # satisfy tasks in the ltq first
             if self._long_term_queue:
@@ -403,6 +403,22 @@ class Scheduler:
                         worker_request = task_instance.poll_worker_request()
                         if worker_request:
                             break
+                        else:
+                            # this task has no pending worker requests
+                            # check if it has waiting workers; and if not,
+                            # this task is considered completed
+                            if not task_instance.waiting_workers:
+                                logger.info('Task %d:%s is finished' %
+                                        (root_task_id, task_instance.task_key))
+                                # safe to remove the task
+                                length = len(self._short_term_queue)
+                                for i in range(0, length):
+                                    if self._short_term_queue[i][1] == root_task_id:
+                                        del self._short_term_queue[i]
+                                        logger.info(
+                                                'Task %d: %s is removed from the short-term queue' % \
+                                                (root_task_id, task_instance.task_key))
+                                heapify(self._short_term_queue)
                     else:
                         # no pending worker requests
                         return
@@ -420,6 +436,7 @@ class Scheduler:
                                 (requester, task_instance.task_key))
                         worker_key = requester
                         self._main_worker_status[requester] = True
+                        on_main_worker = True
                     elif self._idle_workers:
                         task_instance.pop_worker_request()
                         worker_key = self._idle_workers.pop()
@@ -429,7 +446,7 @@ class Scheduler:
 
         if worker_key:
             self._worker_mappings[worker_key] = WorkerJob(root_task_id,
-                    task_key, args, subtask_key, workunit_key)
+                    task_key, args, subtask_key, workunit_key, on_main_worker)
      
             # notify the observers
             for l in self._listeners:

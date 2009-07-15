@@ -541,13 +541,10 @@ class Master(object):
             # main worker.  otherwise a new work request
             # can be made before the worker is released
             
-            # If the source worker is not the main worker, then hold this
-            # worker until the master receives an explicit release message
-            # from the main worker
-            if job.subtask_key:
-                self.scheduler.hold_worker(worker_key)
-            else:
-                self.scheduler.add_worker(worker_key)
+            # If the source worker is not a main worker (used as a special
+            # worker resource), then hold this worker until the master receives
+            # an explicit release message from the main worker
+            self.scheduler.hold_worker(worker_key)
 
             #check to make sure the task was still in the queue.  Its possible this call was made at the same
             # time a task was being canceled.  Only worry about sending the reults back to the Task Head

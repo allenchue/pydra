@@ -241,8 +241,6 @@ class Worker(pb.Referenceable):
         """
         Callback that is called when a job is run in non_blocking mode.
         """
-        if not self.__workunit_key:
-            logger.info('no workunit key!')
         stop_flag = self.__task_instance.STOP_FLAG
         self.__task = None
 
@@ -259,13 +257,17 @@ class Worker(pb.Referenceable):
             #completed normally
             # if the master is still there send the results
             with self.__lock_connection:
-                if self.master:
-                    deferred = self.master.callRemote("send_results", results, self.__workunit_key)
-                    deferred.addErrback(self.send_results_failed, results, self.__workunit_key)
-
-                # master disapeared, hold results until it requests them
+                if not self.__workunit_key:
+                    # this is the main worker
+                    pass
                 else:
-                    self.__results = results
+                    if self.master:
+                        deferred = self.master.callRemote("send_results", results, self.__workunit_key)
+                        deferred.addErrback(self.send_results_failed, results, self.__workunit_key)
+
+                    # master disapeared, hold results until it requests them
+                    else:
+                        self.__results = results
 
 
     def work_failed(self, results):

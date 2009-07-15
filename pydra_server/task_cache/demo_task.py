@@ -128,16 +128,13 @@ class TestParallelTask(ParallelTask):
         ParallelTask.__init__(self)
         self.subtask = TestTask('subtask')
         #assign data in init otherwise it could be consumed
-        self._data = range(10)
+        self._data = range(2)
         self._finished = []
 
     def work_unit_complete(self, data, results):
         logger.info('   Adding results:%s' % results)
         self._finished.append(results)
-        if data == 3:
-            # release the worker
-            return True
-        # the default returning value is None, which means to retain the worker
+        return True
 
     def work_complete(self):
         logger.info('tabulating results!')
