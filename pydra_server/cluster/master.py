@@ -536,11 +536,6 @@ class Master(object):
             logger.info('Worker:%s - completed: %s:%s (%s)' %  \
                     (worker_key, job.task_key, job.subtask_key, job.workunit_key))
 
-            # release the worker back into the idle pool
-            # this must be done before informing the 
-            # main worker.  otherwise a new work request
-            # can be made before the worker is released
-            
             # If the source worker is not a main worker (used as a special
             # worker resource), then hold this worker until the master receives
             # an explicit release message from the main worker

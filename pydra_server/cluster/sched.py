@@ -73,9 +73,8 @@ class Scheduler:
         self._worker_mappings = {} # worker-job mappings
         self._waiting_workers = {} # task-worker mappings
 
-        # the value is a bool value indicating if this main worker is working
-        # on a workunit
-        self._main_worker_status = {}
+        # a set containing all main workers
+        self._main_workers = set()
 
         self.update_interval = 5 # seconds
         self._listeners = []
@@ -188,30 +187,27 @@ class Scheduler:
                         worker_key)
                 return
 
-        job = self.get_worker_job(worker_key)
+        job = self._worker_mappings.get(worker_key, None)
         if job:
             task_instance = self._active_tasks[job.root_task_id]
-            main_status = self._main_worker_status.get(worker_key, None)
-            if main_status is not None:
+            if worker_key in self._main_workers:
                 # this is a main worker
-                if main_status == True:
+                if job.subtask_key:
                     # this main worker was working on a workunit
                     logger.info('Main worker:%s ready for work again' % worker_key)
-                    self._main_worker_status[worker_key] = False
+                    job.subtask_key = None
+                    job.workunit_key = None
                 else:
-                    # reaching here means the whole task has been finished
-                    logger.info('Last worker held by task %s is returned' \
-                            % task_instance.task_key)
+                    logger.info('Main worker:%s finishes the root task' %
+                            worker_key)
                     with self._worker_lock:
+                        self._main_workers.remove(worker_key)
                         self._idle_workers.append(worker_key)
-                        del self._main_worker_status[worker_key]
                         del self._worker_mappings[worker_key]
                     status = STATUS_COMPLETE if task_status is None else task_status
                     task_instance.status = status
                     task_instance.completed_time = datetime.now()
                     task_instance.save()
-
-                    # TODO release all the waiting workers
 
                     with self._queue_lock:
                         if status == STATUS_CANCELLED or status == STATUS_COMPLETE:
@@ -272,7 +268,7 @@ class Scheduler:
 
     def hold_worker(self, worker_key):
         with self._worker_lock:
-            if not self._main_worker_status.get(worker_key, None):
+            if worker_key not in self._main_workers:
                 # we don't need to retain a main worker
                 job = self._worker_mappings.get(worker_key, None)
                 if job:
@@ -292,15 +288,12 @@ class Scheduler:
         """
         job = self.get_worker_job(requester_key)
         if job:
-            main_status = self._main_worker_status.get(requester_key, None)
-            if main_status is None:
-                # mark this worker as a main worker.
-                # it will be considered by the scheduler as a special worker
-                # resource to complete the task.
-                self._main_worker_status[requester_key] = False
+            # mark this worker as a main worker.
+            # it will be considered by the scheduler as a special worker
+            # resource to complete the task.
+            self._main_workers.add(requester_key)
 
             task_instance = self._active_tasks[job.root_task_id]
-            logger.info('queuing one worker request')
             task_instance.queue_worker_request( (requester_key, args,
                         subtask_key, workunit_key) )
 
@@ -371,6 +364,7 @@ class Scheduler:
         worker_key, root_task_id, task_key, args, subtask_key, workunit_key = \
                         None, None, None, None, None, None
         on_main_worker = False
+        finished_main_workers = []
         with self._queue_lock:
             # satisfy tasks in the ltq first
             if self._long_term_queue:
@@ -391,58 +385,52 @@ class Scheduler:
                         task_instance.started_time = datetime.now()
                         task_instance.save()
 
-                        self._main_worker_status[worker_key] = False
+                        self._main_workers.add(worker_key)
                         logger.info('Task %d has been moved from ltq to stq' %
                                 root_task_id)
             elif self._short_term_queue:
-                with self._worker_lock:
-                    task_instance, worker_request = None, None
-                    for task in self._short_term_queue:
-                        root_task_id = task[1]
-                        task_instance = self._active_tasks[root_task_id]
-                        worker_request = task_instance.poll_worker_request()
-                        if worker_request:
-                            break
-                        else:
-                            # this task has no pending worker requests
-                            # check if it has waiting workers; and if not,
-                            # this task is considered completed
-                            if not task_instance.waiting_workers:
-                                logger.info('Task %d:%s is finished' %
-                                        (root_task_id, task_instance.task_key))
-                                # safe to remove the task
-                                length = len(self._short_term_queue)
-                                for i in range(0, length):
-                                    if self._short_term_queue[i][1] == root_task_id:
-                                        del self._short_term_queue[i]
-                                        logger.info(
-                                                'Task %d: %s is removed from the short-term queue' % \
-                                                (root_task_id, task_instance.task_key))
-                                heapify(self._short_term_queue)
+                task_instance, worker_request = None, None
+                for task in self._short_term_queue:
+                    root_task_id = task[1]
+                    task_instance = self._active_tasks[root_task_id]
+                    worker_request = task_instance.poll_worker_request()
+                    if worker_request:
+                        break
                     else:
-                        # no pending worker requests
-                        return
-                    requester, args, subtask_key, workunit_key = worker_request
-                    task_key = task_instance.task_key
-                    if task_instance.waiting_workers:
-                        logger.info('Re-dispatching waiting worker:%s to' % 
-                                worker_key)
-                        worker_key = task_instance.waiting_workers.pop()
-                        task_instance.running_workers.append(worker_key)
-                    elif not self._main_worker_status[requester]:
-                        # the main worker can do a local execution
-                        task_instance.pop_worker_request()
-                        logger.info('Main worker:%s assigned to task %s' %
-                                (requester, task_instance.task_key))
-                        worker_key = requester
-                        self._main_worker_status[requester] = True
-                        on_main_worker = True
-                    elif self._idle_workers:
-                        task_instance.pop_worker_request()
-                        worker_key = self._idle_workers.pop()
-                        task_instance.running_workers.append(worker_key)
-                        logger.info('Worker:%s assigned to task %s' %
-                                (requester, task_instance.task_key))
+                        # this task has no pending worker requests
+                        # check if it has workers running or waiting; and
+                        # if not, this task is considered completed
+                        if not task_instance.waiting_workers and \
+                                not task_instance.running_workers:
+                            logger.info('Task %d:%s is finished by %s' %
+                                    (root_task_id, task_instance.task_key,
+                                     task_instance.main_worker))
+                            finished_main_workers.append(task_instance.main_worker)
+                if worker_request:
+                    with self._worker_lock:
+                        requester, args, subtask_key, workunit_key = worker_request
+                        task_key = task_instance.task_key
+                        if task_instance.waiting_workers:
+                            logger.info('Re-dispatching waiting worker:%s to' % 
+                                    worker_key)
+                            worker_key = task_instance.waiting_workers.pop()
+                            task_instance.running_workers.append(worker_key)
+                        elif not self._worker_mappings[requester].workunit_key:
+                            # the main worker can do a local execution
+                            task_instance.pop_worker_request()
+                            logger.info('Main worker:%s assigned to task %s' %
+                                    (requester, task_instance.task_key))
+                            worker_key = requester
+                            on_main_worker = True
+                        elif self._idle_workers:
+                            task_instance.pop_worker_request()
+                            worker_key = self._idle_workers.pop()
+                            task_instance.running_workers.append(worker_key)
+                            logger.info('Worker:%s assigned to task %s' %
+                                    (requester, task_instance.task_key))
+
+        for main_worker in finished_main_workers:
+            self.add_worker(main_worker)
 
         if worker_key:
             self._worker_mappings[worker_key] = WorkerJob(root_task_id,
