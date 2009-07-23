@@ -396,16 +396,16 @@ class Scheduler:
                     worker_request = task_instance.poll_worker_request()
                     if worker_request:
                         break
-                    else:
-                        # this task has no pending worker requests
-                        # check if it has workers running or waiting; and
-                        # if not, this task is considered completed
-                        if not task_instance.waiting_workers and \
-                                not task_instance.running_workers:
-                            logger.info('Task %d:%s is finished by %s' %
-                                    (root_task_id, task_instance.task_key,
-                                     task_instance.main_worker))
-                            finished_main_workers.append(task_instance.main_worker)
+                    #else:
+                        ## this task has no pending worker requests
+                        ## check if it has workers running or waiting; and
+                        ## if not, this task is considered completed
+                        #if not task_instance.waiting_workers and \
+                                #not task_instance.running_workers:
+                            #logger.info('Task %d:%s is finished by %s' %
+                                    #(root_task_id, task_instance.task_key,
+                                     #task_instance.main_worker))
+                            #finished_main_workers.append(task_instance.main_worker)
                 if worker_request:
                     with self._worker_lock:
                         requester, args, subtask_key, workunit_key = worker_request
@@ -428,9 +428,6 @@ class Scheduler:
                             task_instance.running_workers.append(worker_key)
                             logger.info('Worker:%s assigned to task %s' %
                                     (requester, task_instance.task_key))
-
-        for main_worker in finished_main_workers:
-            self.add_worker(main_worker)
 
         if worker_key:
             self._worker_mappings[worker_key] = WorkerJob(root_task_id,

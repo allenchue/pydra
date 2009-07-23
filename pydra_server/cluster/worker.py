@@ -161,7 +161,7 @@ class Worker(pb.Referenceable):
         """
         Runs a task on this worker
         """
-        logger.info('Calling run_task with key=%s, sub=%s, w=%s, arg=%s' % (key,
+        logger.debug('Calling run_task with key=%s, sub=%s, w=%s, arg=%s' % (key,
                     subtask_key, workunit_key, args))
         #Check to ensure this worker is not already busy.
         # The Master should catch this but lets be defensive.
@@ -257,17 +257,13 @@ class Worker(pb.Referenceable):
             #completed normally
             # if the master is still there send the results
             with self.__lock_connection:
-                if not self.__workunit_key:
-                    # this is the main worker
-                    pass
-                else:
-                    if self.master:
-                        deferred = self.master.callRemote("send_results", results, self.__workunit_key)
-                        deferred.addErrback(self.send_results_failed, results, self.__workunit_key)
+                if self.master:
+                    deferred = self.master.callRemote("send_results", results, self.__workunit_key)
+                    deferred.addErrback(self.send_results_failed, results, self.__workunit_key)
 
-                    # master disapeared, hold results until it requests them
-                    else:
-                        self.__results = results
+                # master disapeared, hold results until it requests them
+                else:
+                    self.__results = results
 
 
     def work_failed(self, results):

@@ -536,15 +536,14 @@ class Master(object):
             logger.info('Worker:%s - completed: %s:%s (%s)' %  \
                     (worker_key, job.task_key, job.subtask_key, job.workunit_key))
 
-            # If the source worker is not a main worker (used as a special
-            # worker resource), then hold this worker until the master receives
-            # an explicit release message from the main worker
-            self.scheduler.hold_worker(worker_key)
 
             #check to make sure the task was still in the queue.  Its possible this call was made at the same
             # time a task was being canceled.  Only worry about sending the reults back to the Task Head
             # if the task is still running
             if job.subtask_key:
+                # Hold this worker until the master receives
+                # an explicit release message from the main worker
+                self.scheduler.hold_worker(worker_key)
                 #if this was a subtask the main task needs the results and to be informed
                 task_instance = self.scheduler.get_task_instance(job.root_task_id);
                 main_worker = self.workers[task_instance.main_worker]
@@ -552,6 +551,12 @@ class Master(object):
                         worker_key)
                 main_worker.remote.callRemote('receive_results', worker_key,
                         results, job.subtask_key, job.workunit_key)
+            else:
+                # this is the root task, so we can return the worker to the
+                # idle pool
+                logger.info("Root task:%s completed by worker:%s" %
+                        (job.task_key, worker_key))
+                self.scheduler.add_worker(worker_key)
 
 
     def task_failed(self, worker_key, results, workunit_key):
